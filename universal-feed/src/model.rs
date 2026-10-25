@@ -42,6 +42,9 @@ pub struct PublicFeed {
 pub struct UserSettings {
     pub user_id: String,
     pub public_feeds: Vec<String>,
+    /// Whether this user's content may be published into shared feeds. Off by default.
+    #[serde(default)]
+    pub publish_opt_in: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +69,8 @@ pub struct Candidate {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct IngestRequest {
+    /// The user whose content this is; must have opted in to publishing.
+    pub user_id: String,
     pub items: Vec<Candidate>,
 }
 
@@ -82,4 +87,17 @@ pub struct IngestedItem {
     pub external_id: String,
     pub id: Uuid,
     pub categories: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PublishingRequest {
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PublishingSetting {
+    pub user_id: String,
+    pub enabled: bool,
+    /// Items removed from shared feeds because this user withdrew consent.
+    pub withdrawn: usize,
 }

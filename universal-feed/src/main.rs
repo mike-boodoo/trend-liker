@@ -8,10 +8,10 @@ mod pg;
 mod repo;
 mod adapters;
 
-use axum::{extract::{Path, State}, http::StatusCode, response::Html, routing::{get, post}, Json, Router};
+use axum::{extract::{Path, State}, http::StatusCode, response::Html, routing::{get, post, put}, Json, Router};
 use serde::Deserialize;
 use std::sync::Arc;
-use repo::{Repo, Subscribed};
+use repo::{Ingested, Repo, Subscribed};
 use store::Store;
 
 #[derive(Clone)] struct AppState { repo: Arc<dyn Repo> }
@@ -41,6 +41,7 @@ async fn main() {
         .route("/", get(index))
         .route("/api/feeds", get(list_feeds))
         .route("/api/ingest", post(ingest_candidates))
+        .route("/api/users/{user}/publishing", put(set_publishing))
         .route("/api/users/{user}/feed", get(user_feed))
         .route("/api/users/{user}/subscriptions", get(get_subscriptions))
         .route("/api/users/{user}/subscriptions", post(subscribe))
@@ -96,7 +97,17 @@ async fn subscribe(State(state): State<AppState>, Path(user): Path<String>, Json
 
 const MAX_INGEST_BATCH: usize = 500;
 
+/// 404 unknown user, 403 user has not opted in to publishing.
 async fn ingest_candidates(State(state): State<AppState>, Json(request): Json<model::IngestRequest>) -> Result<Json<model::IngestReport>, StatusCode> {
     if request.items.len() > MAX_INGEST_BATCH { return Err(StatusCode::PAYLOAD_TOO_LARGE); }
-    state.repo.ingest(request.items).await.map(Json).map_err(internal)
+    match state.repo.ingest(&request.user_id, request.items).await.map_err(internal)? {
+        Ingested::Report(r) => Ok(Json(r)),
+        Ingested::NoUser => Err(StatusCode::NOT_FOUND),
+        Ingested::NotOptedIn => Err(StatusCode::FORBIDDEN),
+    }
+}
+
+/// Turning publishing off also withdraws the user's contributions from shared feeds.
+async fn set_publishing(State(state): State<AppState>, Path(user): Path<String>, Json(request): Json<model::PublishingRequest>) -> Result<Json<model::PublishingSetting>, StatusCode> {
+    state.repo.set_publishing(&user, request.enabled).await.map_err(internal)?.map(Json).ok_or(StatusCode::NOT_FOUND)
 }

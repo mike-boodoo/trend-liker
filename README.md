@@ -18,8 +18,10 @@ Note: X's automation rules restrict bulk/automated liking. Keep it per-user, opt
 A Rust/Axum server (imported from the supplied zip) where **FOR US** = shared public feeds and **FOR ME** = a user's subscriptions to them. See `universal-feed/README.md`.
 
 - Changed from the original: handlers return 404/400 for unknown users/feeds instead of panicking.
-- `POST /api/ingest` takes `{items:[{source, external_id, author, text, url?, score?}]}` (max 500), dedupes on (source, external_id), classifies by keyword (`src/classify.rs`) into existing public feeds, and returns `{ingested, duplicates, unclassified, rejected}`. Unclassified posts are not stored.
-- `trend_liker/forus.py`: `publish_posts()` pushes X posts in; posts from protected accounts are never sent.
+- `POST /api/ingest` takes `{user_id, items:[{source, external_id, author, text, url?, score?}]}` (max 500). **Publishing is opt-in per user**: it returns 404 for an unknown user and 403 unless the user has enabled publishing. It dedupes on (source, external_id), classifies by keyword (`src/classify.rs`) into existing public feeds, and returns `{ingested, duplicates, unclassified, rejected}`. Unclassified posts are not stored.
+- `PUT /api/users/{user}/publishing` with `{"enabled": bool}` turns publishing on/off (default off). Turning it off withdraws everything the user contributed (`withdrawn` in the response), except posts another opted-in user also contributed.
+- `GET /api/users/{user}/subscriptions` includes `publish_opt_in`.
+- `trend_liker/forus.py`: `set_publishing(user, enabled)` and `publish_posts(client, user, posts)` push X posts in; posts from protected accounts are never sent, and the server refuses (403) users who haven't opted in.
 - `trend_liker/forus.py`: `ForUsClient` (HTTP) and `ForUsConnector` (plugs into `Registry.query()` alongside the X source).
 
 ```
