@@ -2,6 +2,8 @@ mod model;
 mod store;
 mod seed;
 mod feed;
+mod classify;
+mod ingest;
 mod adapters;
 
 use axum::{extract::{Path, State}, http::StatusCode, response::Html, routing::{get, post}, Json, Router};
@@ -20,6 +22,7 @@ async fn main() {
     let app = Router::new()
         .route("/", get(index))
         .route("/api/feeds", get(list_feeds))
+        .route("/api/ingest", post(ingest_candidates))
         .route("/api/users/{user}/feed", get(user_feed))
         .route("/api/users/{user}/subscriptions", get(get_subscriptions))
         .route("/api/users/{user}/subscriptions", post(subscribe))
@@ -67,4 +70,11 @@ async fn subscribe(State(state): State<AppState>, Path(user): Path<String>, Json
     let settings = users.get_mut(&user).ok_or(StatusCode::NOT_FOUND)?;
     if !settings.public_feeds.contains(&request.feed) { settings.public_feeds.push(request.feed); }
     Ok(Json(settings.clone()))
+}
+
+const MAX_INGEST_BATCH: usize = 500;
+
+async fn ingest_candidates(State(state): State<AppState>, Json(request): Json<model::IngestRequest>) -> Result<Json<model::IngestReport>, StatusCode> {
+    if request.items.len() > MAX_INGEST_BATCH { return Err(StatusCode::PAYLOAD_TOO_LARGE); }
+    Ok(Json(ingest::ingest(&state.store, request.items)))
 }

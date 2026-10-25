@@ -10,6 +10,7 @@ class Post:
     text: str
     like_count: int = 0
     created_at: str = ""
+    protected: bool = False  # author's account is protected; never republish
 
 
 @dataclass(frozen=True)

@@ -57,3 +57,44 @@ async def test_connector_error_isolated_in_registry():
     reg.register(ForUsConnector(client()))
     res = await reg.query(Query("nobody", frozenset({"ai"})))
     assert res.records == [] and "ForUsError" in res.errors["for-us"]
+
+
+# --- ingest / publish ---
+from trend_liker.forus import MAX_BATCH, publish_posts, to_candidate
+from trend_liker.mock_x import MockXServer, make_tweet
+from trend_liker.models import Post
+from trend_liker.x_client import HttpXClient
+
+
+def test_to_candidate_scores_and_shape():
+    c = to_candidate(Post("7", "a1", "hi rust", like_count=5_000))
+    assert c["source"] == "X" and c["external_id"] == "7" and c["score"] == 0.75
+    assert c["url"].endswith("/7")
+    assert to_candidate(Post("8", "a", "t", like_count=10**9))["score"] == 1.0
+
+
+async def test_publish_skips_protected_and_batches():
+    sent = []
+
+    def h(req):
+        body = json.loads(req.content)
+        sent.append(body["items"])
+        return httpx.Response(200, json={"ingested": [{}] * len(body["items"]),
+                                         "duplicates": 0, "unclassified": 0, "rejected": 0})
+
+    c = ForUsClient(transport=httpx.MockTransport(h))
+    posts = [Post(str(i), "a", "rust") for i in range(MAX_BATCH + 1)]
+    posts.append(Post("p", "priv", "secret rust", protected=True))
+    totals = await publish_posts(c, posts)
+    assert totals["ingested"] == MAX_BATCH + 1 and totals["skipped_protected"] == 1
+    assert [len(b) for b in sent] == [MAX_BATCH, 1]
+    assert all(i["external_id"] != "p" for b in sent for i in b)
+
+
+async def test_end_to_end_x_mock_to_ingest_payload():
+    s = MockXServer({"u1": [make_tweet(1, "Rust news", author="pub"), make_tweet(2, "Rust secret", author="priv")]})
+    s.protected_authors = {"priv"}
+    x = HttpXClient("test-token", transport=s.transport)
+    page = await x.home_timeline("u1")
+    assert {p.id: p.protected for p in page.posts} == {"1": False, "2": True}
+    assert "protected" in s.requests[0].url.params["user.fields"]

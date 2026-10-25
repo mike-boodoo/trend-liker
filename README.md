@@ -18,9 +18,14 @@ Note: X's automation rules restrict bulk/automated liking. Keep it per-user, opt
 A Rust/Axum server (imported from the supplied zip) where **FOR US** = shared public feeds and **FOR ME** = a user's subscriptions to them. See `universal-feed/README.md`.
 
 - Changed from the original: handlers return 404/400 for unknown users/feeds instead of panicking.
-- Its X/TikTok adapters are still placeholders; wiring `x_client.py` output into the server as candidates is the next step.
+- `POST /api/ingest` takes `{items:[{source, external_id, author, text, url?, score?}]}` (max 500), dedupes on (source, external_id), classifies by keyword (`src/classify.rs`) into existing public feeds, and returns `{ingested, duplicates, unclassified, rejected}`. Unclassified posts are not stored.
+- `trend_liker/forus.py`: `publish_posts()` pushes X posts in; posts from protected accounts are never sent.
 - `trend_liker/forus.py`: `ForUsClient` (HTTP) and `ForUsConnector` (plugs into `Registry.query()` alongside the X source).
 
 ```
 cd universal-feed && cargo run      # serves http://127.0.0.1:3000
 ```
+
+Tests: `pytest` (Python) and `cd universal-feed && cargo test` (Rust).
+
+Note: republishing X content into shared feeds is subject to X's developer terms on redistribution/display; check them before exposing this beyond local use.

@@ -15,7 +15,7 @@ pub fn seed(store: &Store) {
     for (text, author, categories, score) in posts {
         let id = Uuid::new_v4();
         store.insert_item(ContentItem {
-            id, source: Source::Local, author: author.to_string(), text: text.to_string(), url: None,
+            id, source: Source::Local, external_id: None, author: author.to_string(), text: text.to_string(), url: None,
             categories: categories.iter().map(|x| x.to_string()).collect(), created_at: Utc::now(), score,
         });
         for category in categories { categorized.entry(category.to_string()).or_default().push(id); }

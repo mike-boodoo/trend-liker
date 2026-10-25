@@ -76,12 +76,17 @@ class HttpXClient:
         params = {
             "max_results": max_results,
             "tweet.fields": "author_id,created_at,public_metrics",
+            "expansions": "author_id",
+            "user.fields": "protected",
         }
         if pagination_token:
             params["pagination_token"] = pagination_token
         body = await self._request(
             "GET", f"/2/users/{user_id}/timelines/reverse_chronological", params=params
         )
+        protected = {
+            u["id"] for u in body.get("includes", {}).get("users", []) if u.get("protected")
+        }
         posts = [
             Post(
                 id=t["id"],
@@ -89,6 +94,7 @@ class HttpXClient:
                 text=t.get("text", ""),
                 like_count=t.get("public_metrics", {}).get("like_count", 0),
                 created_at=t.get("created_at", ""),
+                protected=t.get("author_id", "") in protected,
             )
             for t in body.get("data", [])
         ]

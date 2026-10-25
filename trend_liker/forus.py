@@ -4,6 +4,7 @@ from __future__ import annotations
 import httpx
 
 from .connector import Query, Record
+from .models import Post
 
 DEFAULT_URL = "http://127.0.0.1:3000"
 
@@ -37,6 +38,9 @@ class ForUsClient:
         body = await self._json("POST", f"/api/users/{user}/subscriptions", json={"feed": feed})
         return body["public_feeds"]
 
+    async def ingest(self, items: list[dict]) -> dict:
+        return await self._json("POST", "/api/ingest", json={"items": items})
+
     async def home_feed(self, user: str) -> list[dict]:
         return (await self._json("GET", f"/api/users/{user}/feed"))["items"]
 
@@ -56,3 +60,33 @@ class ForUsConnector:
             if haystack & q.terms:
                 out.append(Record(self.name, item["id"], item["text"], float(item["score"])))
         return out
+
+
+MAX_BATCH = 500  # server rejects larger batches
+LIKES_FOR_FULL_SCORE = 10_000
+
+
+def to_candidate(post: Post) -> dict:
+    """X post -> universal-feed ingest candidate (score = engagement in [0.5, 1])."""
+    score = 0.5 + 0.5 * min(post.like_count, LIKES_FOR_FULL_SCORE) / LIKES_FOR_FULL_SCORE
+    return {
+        "source": "X",
+        "external_id": post.id,
+        "author": post.author_id,
+        "text": post.text,
+        "url": f"https://x.com/i/status/{post.id}",
+        "score": score,
+    }
+
+
+async def publish_posts(client: ForUsClient, posts: list[Post]) -> dict:
+    """Push posts into the shared For Us feeds. Protected-account posts are never sent."""
+    candidates = [to_candidate(p) for p in posts if not p.protected]
+    totals = {"ingested": 0, "duplicates": 0, "unclassified": 0, "rejected": 0,
+              "skipped_protected": len(posts) - len(candidates)}
+    for i in range(0, len(candidates), MAX_BATCH):
+        r = await client.ingest(candidates[i : i + MAX_BATCH])
+        totals["ingested"] += len(r["ingested"])
+        for k in ("duplicates", "unclassified", "rejected"):
+            totals[k] += r[k]
+    return totals

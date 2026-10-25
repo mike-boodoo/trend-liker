@@ -10,6 +10,7 @@ class MockXServer:
     def __init__(self, timelines: dict[str, list[dict]], valid_token: str = "test-token"):
         self.timelines = timelines
         self.valid_token = valid_token
+        self.protected_authors: set[str] = set()
         self.likes: dict[str, set[str]] = {}
         self.requests: list[httpx.Request] = []
         self.fail_next_with: list[int] = []  # queue of forced status codes
@@ -49,7 +50,8 @@ class MockXServer:
         meta: dict = {"result_count": len(chunk)}
         if start + size < len(tweets):
             meta["next_token"] = str(start + size)
-        return httpx.Response(200, json={"data": chunk, "meta": meta})
+        users = [{"id": a, "protected": True} for a in {t["author_id"] for t in chunk} & self.protected_authors]
+        return httpx.Response(200, json={"data": chunk, "meta": meta, "includes": {"users": users}})
 
 
 def make_tweet(i: int, text: str, author: str = "a1", likes: int = 0) -> dict:
