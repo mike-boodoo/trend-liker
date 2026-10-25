@@ -1,0 +1,299 @@
+//! Postgres-backed Repo (sqlx, runtime-checked queries, embedded migrations).
+
+use std::collections::HashSet;
+
+use anyhow::{Context, Result};
+use async_trait::async_trait;
+use chrono::Utc;
+use sqlx::{postgres::PgPoolOptions, PgPool, Row};
+use uuid::Uuid;
+
+use crate::classify::classify;
+use crate::feed::HOME_FEED_LIMIT;
+use crate::ingest::{clamp_score, prepare_text};
+use crate::model::*;
+use crate::repo::{Repo, Subscribed};
+
+pub struct PgRepo {
+    pool: PgPool,
+}
+
+impl PgRepo {
+    /// Connect and apply migrations. `schema` isolates tables (used by tests).
+    pub async fn connect(url: &str, schema: Option<&str>) -> Result<Self> {
+        if let Some(s) = schema {
+            anyhow::ensure!(s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'), "bad schema name");
+            let admin = PgPoolOptions::new().max_connections(1).connect(url).await?;
+            sqlx::query(&format!("create schema if not exists {s}")).execute(&admin).await?;
+            admin.close().await;
+        }
+        let path = schema.map(|s| format!("set search_path to {s}"));
+        let pool = PgPoolOptions::new()
+            .max_connections(10)
+            .after_connect(move |conn, _| {
+                let path = path.clone();
+                Box::pin(async move {
+                    if let Some(p) = path { sqlx::query(&p).execute(&mut *conn).await?; }
+                    Ok(())
+                })
+            })
+            .connect(url)
+            .await
+            .context("connecting to Postgres")?;
+        sqlx::migrate!("./migrations").run(&pool).await.context("running migrations")?;
+        Ok(Self { pool })
+    }
+
+    pub async fn close(&self) { self.pool.close().await; }
+
+    /// Insert demo data only into an empty database.
+    pub async fn seed_if_empty(&self) -> Result<bool> {
+        let n: i64 = sqlx::query_scalar("select count(*) from public_feeds").fetch_one(&self.pool).await?;
+        if n > 0 { return Ok(false); }
+        let d = crate::seed::demo_data();
+        let mut tx = self.pool.begin().await?;
+        for f in &d.feeds {
+            sqlx::query("insert into public_feeds (id, name, description, categories) values ($1,$2,$3,$4)")
+                .bind(&f.id).bind(&f.name).bind(&f.description).bind(&f.categories)
+                .execute(&mut *tx).await?;
+        }
+        for i in &d.items {
+            insert_item(&mut tx, i).await?;
+        }
+        for f in &d.feeds {
+            for item in &f.items {
+                sqlx::query("insert into feed_items (feed_id, item_id) values ($1,$2)")
+                    .bind(&f.id).bind(item).execute(&mut *tx).await?;
+            }
+        }
+        for u in &d.users {
+            sqlx::query("insert into users (user_id) values ($1)").bind(&u.user_id).execute(&mut *tx).await?;
+            for feed in &u.public_feeds {
+                sqlx::query("insert into user_subscriptions (user_id, feed_id) values ($1,$2)")
+                    .bind(&u.user_id).bind(feed).execute(&mut *tx).await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+}
+
+async fn insert_item(tx: &mut sqlx::PgConnection, i: &ContentItem) -> Result<u64> {
+    let r = sqlx::query(
+        "insert into content_items (id, source, external_id, author, text, url, categories, created_at, score)
+         values ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+         on conflict (source, external_id) where external_id is not null do nothing",
+    )
+    .bind(i.id).bind(i.source.as_str()).bind(&i.external_id).bind(&i.author).bind(&i.text)
+    .bind(&i.url).bind(&i.categories).bind(i.created_at).bind(i.score)
+    .execute(tx).await?;
+    Ok(r.rows_affected())
+}
+
+fn row_to_item(r: &sqlx::postgres::PgRow) -> Result<ContentItem> {
+    let source: String = r.try_get("source")?;
+    Ok(ContentItem {
+        id: r.try_get("id")?,
+        source: Source::parse(&source).with_context(|| format!("unknown source {source:?} in database"))?,
+        external_id: r.try_get("external_id")?,
+        author: r.try_get("author")?,
+        text: r.try_get("text")?,
+        url: r.try_get("url")?,
+        categories: r.try_get("categories")?,
+        created_at: r.try_get("created_at")?,
+        score: r.try_get("score")?,
+    })
+}
+
+async fn subscriptions(pool: &PgPool, user: &str) -> Result<Vec<String>> {
+    Ok(sqlx::query_scalar("select feed_id from user_subscriptions where user_id = $1 order by position")
+        .bind(user).fetch_all(pool).await?)
+}
+
+#[async_trait]
+impl Repo for PgRepo {
+    async fn list_feeds(&self) -> Result<Vec<PublicFeed>> {
+        let rows = sqlx::query(
+            "select f.id, f.name, f.description, f.categories,
+                    coalesce(array_agg(fi.item_id) filter (where fi.item_id is not null), '{}') as items
+             from public_feeds f left join feed_items fi on fi.feed_id = f.id
+             group by f.id order by f.id",
+        ).fetch_all(&self.pool).await?;
+        rows.iter().map(|r| Ok(PublicFeed {
+            id: r.try_get("id")?, name: r.try_get("name")?, description: r.try_get("description")?,
+            categories: r.try_get("categories")?, items: r.try_get::<Vec<Uuid>, _>("items")?,
+        })).collect()
+    }
+
+    async fn get_user(&self, id: &str) -> Result<Option<UserSettings>> {
+        let exists: bool = sqlx::query_scalar("select exists (select 1 from users where user_id = $1)")
+            .bind(id).fetch_one(&self.pool).await?;
+        if !exists { return Ok(None); }
+        Ok(Some(UserSettings { user_id: id.to_string(), public_feeds: subscriptions(&self.pool, id).await? }))
+    }
+
+    async fn subscribe(&self, user: &str, feed: &str) -> Result<Subscribed> {
+        let feed_ok: bool = sqlx::query_scalar("select exists (select 1 from public_feeds where id = $1)")
+            .bind(feed).fetch_one(&self.pool).await?;
+        if !feed_ok { return Ok(Subscribed::NoFeed); }
+        let Some(_) = self.get_user(user).await? else { return Ok(Subscribed::NoUser) };
+        sqlx::query("insert into user_subscriptions (user_id, feed_id) values ($1,$2) on conflict do nothing")
+            .bind(user).bind(feed).execute(&self.pool).await?;
+        Ok(match self.get_user(user).await? {
+            Some(s) => Subscribed::Ok(s),
+            None => Subscribed::NoUser,
+        })
+    }
+
+    async fn home_feed(&self, user: &str) -> Result<Option<HomeFeed>> {
+        let Some(settings) = self.get_user(user).await? else { return Ok(None) };
+        let rows = sqlx::query(
+            "select i.* from content_items i
+             where i.id in (select fi.item_id from feed_items fi
+                            join user_subscriptions s on s.feed_id = fi.feed_id
+                            where s.user_id = $1)
+             order by i.score desc, i.created_at desc, i.id
+             limit $2",
+        ).bind(user).bind(HOME_FEED_LIMIT as i64).fetch_all(&self.pool).await?;
+        let items = rows.iter().map(row_to_item).collect::<Result<Vec<_>>>()?;
+        Ok(Some(HomeFeed { user_id: user.to_string(), feeds: settings.public_feeds, items }))
+    }
+
+    async fn ingest(&self, candidates: Vec<Candidate>) -> Result<IngestReport> {
+        let mut report = IngestReport::default();
+        let mut tx = self.pool.begin().await?;
+        let allowed: HashSet<String> = sqlx::query_scalar("select id from public_feeds")
+            .fetch_all(&mut *tx).await?.into_iter().collect();
+
+        for c in candidates {
+            let Some(text) = prepare_text(&c) else { report.rejected += 1; continue };
+            let dup: bool = sqlx::query_scalar(
+                "select exists (select 1 from content_items where source = $1 and external_id = $2)",
+            ).bind(c.source.as_str()).bind(&c.external_id).fetch_one(&mut *tx).await?;
+            if dup { report.duplicates += 1; continue; }
+            let categories = classify(&text, &|cat| allowed.contains(cat));
+            if categories.is_empty() { report.unclassified += 1; continue; }
+
+            let item = ContentItem {
+                id: Uuid::new_v4(), source: c.source, external_id: Some(c.external_id.clone()),
+                author: c.author.clone(), text, url: c.url.clone(), categories: categories.clone(),
+                created_at: Utc::now(), score: clamp_score(&c),
+            };
+            // A concurrent ingest may win the race; the unique index makes that a duplicate.
+            if insert_item(&mut tx, &item).await? == 0 { report.duplicates += 1; continue; }
+            for cat in &categories {
+                sqlx::query("insert into feed_items (feed_id, item_id) values ($1,$2)")
+                    .bind(cat).bind(item.id).execute(&mut *tx).await?;
+            }
+            report.ingested.push(IngestedItem { external_id: c.external_id, id: item.id, categories });
+        }
+        tx.commit().await?;
+        Ok(report)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Store;
+
+    /// None (test skipped) unless TEST_DATABASE_URL is set.
+    async fn fresh() -> Option<PgRepo> {
+        let url = std::env::var("TEST_DATABASE_URL").ok()?;
+        let schema = format!("t_{}", Uuid::new_v4().simple());
+        let repo = PgRepo::connect(&url, Some(&schema)).await.unwrap();
+        assert!(repo.seed_if_empty().await.unwrap());
+        Some(repo)
+    }
+
+    fn cand(source: Source, ext: &str, text: &str, score: Option<f64>) -> Candidate {
+        Candidate { source, external_id: ext.into(), author: "a".into(), text: text.into(), url: None, score }
+    }
+
+    #[tokio::test]
+    async fn seed_is_idempotent_and_matches_demo_shape() {
+        let Some(pg) = fresh().await else { return eprintln!("skipped: TEST_DATABASE_URL unset") };
+        assert!(!pg.seed_if_empty().await.unwrap());
+        let feeds = pg.list_feeds().await.unwrap();
+        assert_eq!(feeds.len(), 8);
+        let ai = feeds.iter().find(|f| f.id == "ai").unwrap();
+        assert_eq!(ai.items.len(), 3);
+        let home = pg.home_feed("demo").await.unwrap().unwrap();
+        assert_eq!(home.feeds, vec!["ai", "rust", "cloud"]);
+        assert_eq!(home.items.len(), 6);
+        assert_eq!(home.items[0].score, 0.98);
+    }
+
+    #[tokio::test]
+    async fn subscribe_semantics() {
+        let Some(pg) = fresh().await else { return };
+        assert!(matches!(pg.subscribe("nobody", "ai").await.unwrap(), Subscribed::NoUser));
+        assert!(matches!(pg.subscribe("demo", "nope").await.unwrap(), Subscribed::NoFeed));
+        assert!(matches!(pg.subscribe("nobody", "nope").await.unwrap(), Subscribed::NoFeed)); // feed checked first
+        let Subscribed::Ok(s) = pg.subscribe("demo", "agents").await.unwrap() else { panic!() };
+        assert_eq!(s.public_feeds, vec!["ai", "rust", "cloud", "agents"]);
+        let Subscribed::Ok(s) = pg.subscribe("demo", "agents").await.unwrap() else { panic!() };
+        assert_eq!(s.public_feeds.len(), 4); // idempotent, order preserved
+        assert!(pg.home_feed("nobody").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn ingest_dedupes_classifies_and_persists() {
+        let Some(pg) = fresh().await else { return };
+        let r = pg.ingest(vec![
+            cand(Source::X, "1", "Tokio and axum deep dive", Some(0.99)),
+            cand(Source::X, "1", "Tokio and axum deep dive", Some(0.99)),
+            cand(Source::X, "2", "my lunch", None),
+            cand(Source::X, "", "rust", None),
+            cand(Source::X, "3", "rust", Some(7.0)),
+        ]).await.unwrap();
+        assert_eq!((r.ingested.len(), r.duplicates, r.unclassified, r.rejected), (2, 1, 1, 1));
+        assert_eq!(pg.ingest(vec![cand(Source::X, "1", "rust", None)]).await.unwrap().duplicates, 1);
+        assert_eq!(pg.ingest(vec![cand(Source::TikTok, "1", "rust", None)]).await.unwrap().ingested.len(), 1);
+
+        let home = pg.home_feed("demo").await.unwrap().unwrap();
+        assert_eq!(home.items[0].external_id.as_deref(), Some("3")); // clamped to 1.0, outranks 0.99
+        assert_eq!(home.items[0].score, 1.0);
+        assert!(home.items.iter().any(|i| i.source == Source::TikTok));
+    }
+
+    #[tokio::test]
+    async fn concurrent_ingest_of_same_post_stores_it_once() {
+        let Some(pg) = fresh().await else { return };
+        let pg = std::sync::Arc::new(pg);
+        let tasks: Vec<_> = (0..8).map(|_| {
+            let pg = pg.clone();
+            tokio::spawn(async move { pg.ingest(vec![cand(Source::X, "race", "rust news", None)]).await.unwrap() })
+        }).collect();
+        let mut ingested = 0;
+        for t in tasks { ingested += t.await.unwrap().ingested.len(); }
+        assert_eq!(ingested, 1);
+        let n: i64 = sqlx::query_scalar("select count(*) from content_items where external_id = 'race'")
+            .fetch_one(&pg.pool).await.unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[tokio::test]
+    async fn parity_with_in_memory_store() {
+        let Some(pg) = fresh().await else { return };
+        let mem = Store::new();
+        crate::seed::seed(&mem);
+        let batch = || vec![
+            cand(Source::X, "a", "Agents with MCP #AI", Some(0.7)),
+            cand(Source::X, "a", "dup", None),
+            cand(Source::X, "b", "k8s helm charts", None),
+            cand(Source::X, "c", "nothing relevant", None),
+            cand(Source::X, " ", "rust", None),
+        ];
+        let (rm, rp) = (Repo::ingest(&mem, batch()).await.unwrap(), pg.ingest(batch()).await.unwrap());
+        assert_eq!((rm.ingested.len(), rm.duplicates, rm.unclassified, rm.rejected),
+                   (rp.ingested.len(), rp.duplicates, rp.unclassified, rp.rejected));
+        for user in ["demo", "nobody"] {
+            let (hm, hp) = (Repo::home_feed(&mem, user).await.unwrap(), pg.home_feed(user).await.unwrap());
+            let texts = |h: Option<HomeFeed>| h.map(|h| h.items.iter().map(|i| (i.text.clone(), i.score)).collect::<Vec<_>>());
+            assert_eq!(texts(hm), texts(hp));
+        }
+        let cats = |v: Vec<PublicFeed>| v.into_iter().map(|f| (f.id, f.items.len())).collect::<Vec<_>>();
+        assert_eq!(cats(Repo::list_feeds(&mem).await.unwrap()), cats(pg.list_feeds().await.unwrap()));
+    }
+}

@@ -4,21 +4,39 @@ mod seed;
 mod feed;
 mod classify;
 mod ingest;
+mod pg;
+mod repo;
 mod adapters;
 
 use axum::{extract::{Path, State}, http::StatusCode, response::Html, routing::{get, post}, Json, Router};
 use serde::Deserialize;
+use std::sync::Arc;
+use repo::{Repo, Subscribed};
 use store::Store;
 
-#[derive(Clone)] struct AppState { store: Store }
+#[derive(Clone)] struct AppState { repo: Arc<dyn Repo> }
 #[derive(Debug, Deserialize)] struct SubscriptionRequest { feed: String }
 
 #[tokio::main]
 async fn main() {
     dotenvy::dotenv().ok();
-    let store = Store::new();
-    seed::seed(&store);
-    let state = AppState { store };
+    let repo: Arc<dyn Repo> = match std::env::var("DATABASE_URL").ok().filter(|u| !u.is_empty()) {
+        Some(url) => {
+            let pg = pg::PgRepo::connect(&url, None).await.expect("failed to connect to Postgres");
+            if std::env::var("SEED_DEMO").map(|v| v != "0").unwrap_or(true) {
+                if pg.seed_if_empty().await.expect("seeding failed") { println!("Seeded demo data into Postgres"); }
+            }
+            println!("Storage: Postgres");
+            Arc::new(pg)
+        }
+        None => {
+            let store = Store::new();
+            seed::seed(&store);
+            println!("Storage: in-memory (set DATABASE_URL for Postgres)");
+            Arc::new(store)
+        }
+    };
+    let state = AppState { repo };
     let app = Router::new()
         .route("/", get(index))
         .route("/api/feeds", get(list_feeds))
@@ -54,27 +72,31 @@ loadSubscriptions();loadFeed();
 </script></body></html>"##)
 }
 
-async fn list_feeds(State(state): State<AppState>) -> Json<Vec<model::PublicFeed>> {
-    let feeds = state.store.feeds.read().unwrap();
-    Json(feeds.values().cloned().collect())
+fn internal<E: std::fmt::Display>(e: E) -> StatusCode {
+    eprintln!("internal error: {e:#}");
+    StatusCode::INTERNAL_SERVER_ERROR
+}
+
+async fn list_feeds(State(state): State<AppState>) -> Result<Json<Vec<model::PublicFeed>>, StatusCode> {
+    state.repo.list_feeds().await.map(Json).map_err(internal)
 }
 async fn user_feed(State(state): State<AppState>, Path(user): Path<String>) -> Result<Json<model::HomeFeed>, StatusCode> {
-    feed::build_home_feed(&state.store, &user).map(Json).ok_or(StatusCode::NOT_FOUND)
+    state.repo.home_feed(&user).await.map_err(internal)?.map(Json).ok_or(StatusCode::NOT_FOUND)
 }
 async fn get_subscriptions(State(state): State<AppState>, Path(user): Path<String>) -> Result<Json<model::UserSettings>, StatusCode> {
-    state.store.get_user(&user).map(Json).ok_or(StatusCode::NOT_FOUND)
+    state.repo.get_user(&user).await.map_err(internal)?.map(Json).ok_or(StatusCode::NOT_FOUND)
 }
 async fn subscribe(State(state): State<AppState>, Path(user): Path<String>, Json(request): Json<SubscriptionRequest>) -> Result<Json<model::UserSettings>, StatusCode> {
-    if !state.store.feeds.read().unwrap().contains_key(&request.feed) { return Err(StatusCode::BAD_REQUEST); }
-    let mut users = state.store.users.write().unwrap();
-    let settings = users.get_mut(&user).ok_or(StatusCode::NOT_FOUND)?;
-    if !settings.public_feeds.contains(&request.feed) { settings.public_feeds.push(request.feed); }
-    Ok(Json(settings.clone()))
+    match state.repo.subscribe(&user, &request.feed).await.map_err(internal)? {
+        Subscribed::Ok(settings) => Ok(Json(settings)),
+        Subscribed::NoUser => Err(StatusCode::NOT_FOUND),
+        Subscribed::NoFeed => Err(StatusCode::BAD_REQUEST),
+    }
 }
 
 const MAX_INGEST_BATCH: usize = 500;
 
 async fn ingest_candidates(State(state): State<AppState>, Json(request): Json<model::IngestRequest>) -> Result<Json<model::IngestReport>, StatusCode> {
     if request.items.len() > MAX_INGEST_BATCH { return Err(StatusCode::PAYLOAD_TOO_LARGE); }
-    Ok(Json(ingest::ingest(&state.store, request.items)))
+    state.repo.ingest(request.items).await.map(Json).map_err(internal)
 }

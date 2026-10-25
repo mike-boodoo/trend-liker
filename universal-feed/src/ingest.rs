@@ -6,6 +6,16 @@ use uuid::Uuid;
 
 const MAX_TEXT_CHARS: usize = 2000;
 
+/// Trimmed/truncated text, or None when the candidate must be rejected.
+pub fn prepare_text(c: &Candidate) -> Option<String> {
+    let text: String = c.text.trim().chars().take(MAX_TEXT_CHARS).collect();
+    (!text.is_empty() && !c.external_id.trim().is_empty()).then_some(text)
+}
+
+pub fn clamp_score(c: &Candidate) -> f64 {
+    c.score.filter(|s| s.is_finite()).unwrap_or(0.5).clamp(0.0, 1.0)
+}
+
 pub fn ingest(store: &Store, candidates: Vec<Candidate>) -> IngestReport {
     let mut report = IngestReport::default();
     // Lock order matches feed::build_home_feed (feeds, then items) to avoid deadlock.
@@ -13,11 +23,10 @@ pub fn ingest(store: &Store, candidates: Vec<Candidate>) -> IngestReport {
     let mut items = store.items.write().unwrap();
 
     for c in candidates {
-        let text: String = c.text.trim().chars().take(MAX_TEXT_CHARS).collect();
-        if text.is_empty() || c.external_id.trim().is_empty() {
+        let Some(text) = prepare_text(&c) else {
             report.rejected += 1;
             continue;
-        }
+        };
         let is_dup = items
             .values()
             .any(|i| i.source == c.source && i.external_id.as_deref() == Some(c.external_id.as_str()));
@@ -31,7 +40,7 @@ pub fn ingest(store: &Store, candidates: Vec<Candidate>) -> IngestReport {
             continue;
         }
         let id = Uuid::new_v4();
-        let score = c.score.filter(|s| s.is_finite()).unwrap_or(0.5).clamp(0.0, 1.0);
+        let score = clamp_score(&c);
         items.insert(id, ContentItem {
             id,
             source: c.source,

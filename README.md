@@ -26,6 +26,14 @@ A Rust/Axum server (imported from the supplied zip) where **FOR US** = shared pu
 cd universal-feed && cargo run      # serves http://127.0.0.1:3000
 ```
 
-Tests: `pytest` (Python) and `cd universal-feed && cargo test` (Rust).
+### Storage
+
+By default the server keeps everything in memory. Set `DATABASE_URL` to use Postgres instead: migrations (`universal-feed/migrations/`) run on startup, and demo data is seeded only into an empty database (`SEED_DEMO=0` disables). `(source, external_id)` has a unique index, so ingest dedupe is enforced by the database even under concurrent writers. Home feeds are capped at 500 items in both backends.
+
+```
+DATABASE_URL=postgres://user:pass@localhost:5432/feed cargo run
+```
+
+Tests: `pytest` (Python) and `cd universal-feed && cargo test` (Rust). Set `TEST_DATABASE_URL` to also run the Postgres tests (each uses its own throwaway schema and leaves it behind; use a scratch database); without it they are skipped.
 
 Note: republishing X content into shared feeds is subject to X's developer terms on redistribution/display; check them before exposing this beyond local use.

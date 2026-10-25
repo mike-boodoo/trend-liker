@@ -5,6 +5,15 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Source { Local, X, TikTok }
 
+impl Source {
+    pub fn as_str(&self) -> &'static str {
+        match self { Source::Local => "Local", Source::X => "X", Source::TikTok => "TikTok" }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        match s { "Local" => Some(Source::Local), "X" => Some(Source::X), "TikTok" => Some(Source::TikTok), _ => None }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContentItem {
     pub id: Uuid,

@@ -1,5 +1,7 @@
 use crate::{model::{ContentItem, HomeFeed}, store::Store};
 
+pub const HOME_FEED_LIMIT: usize = 500;
+
 pub fn build_home_feed(store: &Store, user_id: &str) -> Option<HomeFeed> {
     let user = store.get_user(user_id)?;
     let feeds = store.feeds.read().unwrap();
@@ -14,5 +16,6 @@ pub fn build_home_feed(store: &Store, user_id: &str) -> Option<HomeFeed> {
         }
     }
     result.sort_by(|a,b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    result.truncate(HOME_FEED_LIMIT);
     Some(HomeFeed { user_id: user_id.to_string(), feeds: user.public_feeds, items: result })
 }
