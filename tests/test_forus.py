@@ -78,6 +78,7 @@ async def test_publish_skips_protected_and_batches():
 
     def h(req):
         body = json.loads(req.content)
+        assert body["user_id"] == "demo"
         sent.append(body["items"])
         return httpx.Response(200, json={"ingested": [{}] * len(body["items"]),
                                          "duplicates": 0, "unclassified": 0, "rejected": 0})
@@ -85,7 +86,7 @@ async def test_publish_skips_protected_and_batches():
     c = ForUsClient(transport=httpx.MockTransport(h))
     posts = [Post(str(i), "a", "rust") for i in range(MAX_BATCH + 1)]
     posts.append(Post("p", "priv", "secret rust", protected=True))
-    totals = await publish_posts(c, posts)
+    totals = await publish_posts(c, "demo", posts)
     assert totals["ingested"] == MAX_BATCH + 1 and totals["skipped_protected"] == 1
     assert [len(b) for b in sent] == [MAX_BATCH, 1]
     assert all(i["external_id"] != "p" for b in sent for i in b)
@@ -98,3 +99,22 @@ async def test_end_to_end_x_mock_to_ingest_payload():
     page = await x.home_timeline("u1")
     assert {p.id: p.protected for p in page.posts} == {"1": False, "2": True}
     assert "protected" in s.requests[0].url.params["user.fields"]
+
+
+async def test_set_publishing_request_shape():
+    seen = {}
+
+    def h(req):
+        seen.update(method=req.method, path=req.url.path, body=json.loads(req.content))
+        return httpx.Response(200, json={"user_id": "demo", "enabled": False, "withdrawn": 2})
+
+    r = await ForUsClient(transport=httpx.MockTransport(h)).set_publishing("demo", False)
+    assert seen == {"method": "PUT", "path": "/api/users/demo/publishing", "body": {"enabled": False}}
+    assert r["withdrawn"] == 2
+
+
+async def test_publish_without_opt_in_surfaces_403():
+    c = ForUsClient(transport=httpx.MockTransport(lambda req: httpx.Response(403)))
+    with pytest.raises(ForUsError) as e:
+        await publish_posts(c, "demo", [Post("1", "a", "rust")])
+    assert e.value.status == 403

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .finance import is_finance
 from .models import Post, Profile, RunReport
 from .x_client import XClient, XError
 
@@ -14,6 +15,8 @@ class Policy:
     max_pages: int = 3
     page_size: int = 20
     dry_run: bool = True  # liking for real must be an explicit opt-in
+    # Auto-liking stock posts across accounts is coordinated amplification (pump risk).
+    like_finance: bool = False
 
 
 def score(post: Post, profile: Profile) -> float:
@@ -45,8 +48,10 @@ class FeedAgent:
         report = RunReport(self.profile.user_id, dry_run=self.policy.dry_run)
         posts = await self.fetch()
         report.seen = len(posts)
+        eligible = [p for p in posts if self.policy.like_finance or not is_finance(p.text)]
+        report.skipped_finance = len(posts) - len(eligible)
         ranked = sorted(
-            (p for p in posts if score(p, self.profile) > 0),
+            (p for p in eligible if score(p, self.profile) > 0),
             key=lambda p: score(p, self.profile),
             reverse=True,
         )

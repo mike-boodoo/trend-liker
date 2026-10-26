@@ -38,8 +38,14 @@ class ForUsClient:
         body = await self._json("POST", f"/api/users/{user}/subscriptions", json={"feed": feed})
         return body["public_feeds"]
 
-    async def ingest(self, items: list[dict]) -> dict:
-        return await self._json("POST", "/api/ingest", json={"items": items})
+    async def set_publishing(self, user: str, enabled: bool) -> dict:
+        """Opt in/out of publishing. Opting out withdraws the user's contributions
+        (the result's `withdrawn` counts the items removed from shared feeds)."""
+        return await self._json("PUT", f"/api/users/{user}/publishing", json={"enabled": enabled})
+
+    async def ingest(self, user: str, items: list[dict]) -> dict:
+        """Raises ForUsError(403) if `user` has not opted in to publishing."""
+        return await self._json("POST", "/api/ingest", json={"user_id": user, "items": items})
 
     async def home_feed(self, user: str) -> list[dict]:
         return (await self._json("GET", f"/api/users/{user}/feed"))["items"]
@@ -79,13 +85,16 @@ def to_candidate(post: Post) -> dict:
     }
 
 
-async def publish_posts(client: ForUsClient, posts: list[Post]) -> dict:
-    """Push posts into the shared For Us feeds. Protected-account posts are never sent."""
+async def publish_posts(client: ForUsClient, user: str, posts: list[Post]) -> dict:
+    """Push `user`'s posts into the shared For Us feeds.
+
+    Protected-account posts are never sent, and the server rejects the call (403)
+    unless the user has opted in via `set_publishing`."""
     candidates = [to_candidate(p) for p in posts if not p.protected]
     totals = {"ingested": 0, "duplicates": 0, "unclassified": 0, "rejected": 0,
               "skipped_protected": len(posts) - len(candidates)}
     for i in range(0, len(candidates), MAX_BATCH):
-        r = await client.ingest(candidates[i : i + MAX_BATCH])
+        r = await client.ingest(user, candidates[i : i + MAX_BATCH])
         totals["ingested"] += len(r["ingested"])
         for k in ("duplicates", "unclassified", "rejected"):
             totals[k] += r[k]

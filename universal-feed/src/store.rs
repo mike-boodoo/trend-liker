@@ -1,15 +1,17 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use uuid::Uuid;
 use async_trait::async_trait;
-use crate::model::{Candidate, ContentItem, HomeFeed, IngestReport, PublicFeed, UserSettings};
-use crate::repo::{Repo, Subscribed};
+use crate::model::{Candidate, ContentItem, HomeFeed, PublicFeed, PublishingSetting, UserSettings};
+use crate::repo::{Ingested, Repo, Subscribed};
 
 #[derive(Clone)]
 pub struct Store {
     pub items: Arc<RwLock<HashMap<Uuid, ContentItem>>>,
     pub feeds: Arc<RwLock<HashMap<String, PublicFeed>>>,
     pub users: Arc<RwLock<HashMap<String, UserSettings>>>,
+    /// item -> users who contributed it. Lock order everywhere: feeds, items, contributors, users.
+    pub contributors: Arc<RwLock<HashMap<Uuid, HashSet<String>>>>,
 }
 
 impl Store {
@@ -18,6 +20,7 @@ impl Store {
             items: Arc::new(RwLock::new(HashMap::new())),
             feeds: Arc::new(RwLock::new(HashMap::new())),
             users: Arc::new(RwLock::new(HashMap::new())),
+            contributors: Arc::new(RwLock::new(HashMap::new())),
         }
     }
     pub fn insert_item(&self, item: ContentItem) { self.items.write().unwrap().insert(item.id, item); }
@@ -43,10 +46,31 @@ impl Repo for Store {
         if !settings.public_feeds.iter().any(|f| f == feed) { settings.public_feeds.push(feed.to_string()); }
         Ok(Subscribed::Ok(settings.clone()))
     }
+    async fn set_publishing(&self, user: &str, enabled: bool) -> anyhow::Result<Option<PublishingSetting>> {
+        let mut feeds = self.feeds.write().unwrap();
+        let mut items = self.items.write().unwrap();
+        let mut contributors = self.contributors.write().unwrap();
+        let mut users = self.users.write().unwrap();
+        let Some(settings) = users.get_mut(user) else { return Ok(None) };
+        settings.publish_opt_in = enabled;
+        let mut withdrawn = 0;
+        if !enabled {
+            let orphaned: Vec<Uuid> = contributors.iter_mut()
+                .filter_map(|(id, who)| (who.remove(user) && who.is_empty()).then_some(*id))
+                .collect();
+            for id in &orphaned {
+                contributors.remove(id);
+                items.remove(id);
+                for feed in feeds.values_mut() { feed.items.retain(|i| i != id); }
+            }
+            withdrawn = orphaned.len();
+        }
+        Ok(Some(PublishingSetting { user_id: user.to_string(), enabled, withdrawn }))
+    }
     async fn home_feed(&self, user: &str) -> anyhow::Result<Option<HomeFeed>> {
         Ok(crate::feed::build_home_feed(self, user))
     }
-    async fn ingest(&self, items: Vec<Candidate>) -> anyhow::Result<IngestReport> {
-        Ok(crate::ingest::ingest(self, items))
+    async fn ingest(&self, user: &str, items: Vec<Candidate>) -> anyhow::Result<Ingested> {
+        Ok(crate::ingest::ingest(self, user, items))
     }
 }

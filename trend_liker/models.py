@@ -35,4 +35,5 @@ class RunReport:
     selected: list[Post] = field(default_factory=list)
     liked: list[str] = field(default_factory=list)
     dry_run: bool = True
+    skipped_finance: int = 0
     errors: list[str] = field(default_factory=list)
