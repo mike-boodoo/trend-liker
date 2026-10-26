@@ -6,6 +6,8 @@ mod classify;
 mod ingest;
 mod pg;
 mod repo;
+mod lobby;
+mod lobby_api;
 mod adapters;
 
 use axum::{extract::{Path, State}, http::StatusCode, response::Html, routing::{get, post, put}, Json, Router};
@@ -14,7 +16,7 @@ use std::sync::Arc;
 use repo::{Ingested, Repo, Subscribed};
 use store::Store;
 
-#[derive(Clone)] struct AppState { repo: Arc<dyn Repo> }
+#[derive(Clone)] pub struct AppState { pub repo: Arc<dyn Repo>, pub lobbies: Arc<lobby::Lobbies> }
 #[derive(Debug, Deserialize)] struct SubscriptionRequest { feed: String }
 
 #[tokio::main]
@@ -36,7 +38,7 @@ async fn main() {
             Arc::new(store)
         }
     };
-    let state = AppState { repo };
+    let state = AppState { repo, lobbies: Arc::new(lobby::Lobbies::default()) };
     let app = Router::new()
         .route("/", get(index))
         .route("/api/feeds", get(list_feeds))
@@ -45,6 +47,7 @@ async fn main() {
         .route("/api/users/{user}/feed", get(user_feed))
         .route("/api/users/{user}/subscriptions", get(get_subscriptions))
         .route("/api/users/{user}/subscriptions", post(subscribe))
+        .merge(lobby_api::routes())
         .with_state(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await.expect("failed to bind localhost:3000");
     println!("Universal Feed Server\nhttp://localhost:3000");
@@ -73,7 +76,7 @@ loadSubscriptions();loadFeed();
 </script></body></html>"##)
 }
 
-fn internal<E: std::fmt::Display>(e: E) -> StatusCode {
+pub fn internal<E: std::fmt::Display>(e: E) -> StatusCode {
     eprintln!("internal error: {e:#}");
     StatusCode::INTERNAL_SERVER_ERROR
 }
@@ -95,7 +98,7 @@ async fn subscribe(State(state): State<AppState>, Path(user): Path<String>, Json
     }
 }
 
-const MAX_INGEST_BATCH: usize = 500;
+pub const MAX_INGEST_BATCH: usize = 500;
 
 /// 404 unknown user, 403 user has not opted in to publishing.
 async fn ingest_candidates(State(state): State<AppState>, Json(request): Json<model::IngestRequest>) -> Result<Json<model::IngestReport>, StatusCode> {
@@ -109,5 +112,7 @@ async fn ingest_candidates(State(state): State<AppState>, Json(request): Json<mo
 
 /// Turning publishing off also withdraws the user's contributions from shared feeds.
 async fn set_publishing(State(state): State<AppState>, Path(user): Path<String>, Json(request): Json<model::PublishingRequest>) -> Result<Json<model::PublishingSetting>, StatusCode> {
-    state.repo.set_publishing(&user, request.enabled).await.map_err(internal)?.map(Json).ok_or(StatusCode::NOT_FOUND)
+    let mut setting = state.repo.set_publishing(&user, request.enabled).await.map_err(internal)?.ok_or(StatusCode::NOT_FOUND)?;
+    if !request.enabled { setting.withdrawn += state.lobbies.withdraw_everywhere(&user); }
+    Ok(Json(setting))
 }
