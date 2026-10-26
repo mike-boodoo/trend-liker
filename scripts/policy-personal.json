@@ -1,0 +1,5 @@
+{
+  "affinity": 0.9,
+  "seen_penalty": 2.0,
+  "exploration": 0.0
+}

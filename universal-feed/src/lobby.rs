@@ -192,6 +192,8 @@ pub struct Ranked {
     pub explore: bool,
     /// False for finance posts the policy refuses to amplify.
     pub amplified: bool,
+    /// The viewer's own votes on this post (impressions excluded).
+    pub mine: Vec<Kind>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -444,11 +446,14 @@ impl Lobby {
             }
             let prior = if amplified { self.policy.overlap_prior * (i.contributors.len() as f64).ln() } else { 0.0 };
             let seen = mine.is_some_and(|v| v.contains_key(&i.id));
+            let mut my_votes: Vec<Kind> = mine.and_then(|v| v.get(&i.id))
+                .map(|m| m.keys().copied().filter(|k| *k != Kind::Impression).collect()).unwrap_or_default();
+            my_votes.sort_by_key(|k| *k as u8);
             let penalty = if seen { self.policy.seen_penalty } else { 0.0 };
             let score = (1.0 - alpha) * global + alpha * personal + prior + 0.1 * i.source_score - penalty;
             Ranked {
                 item: i.clone(), score, global, personal, contributors: i.contributors.len(),
-                likes, bookmarks, seen, explore: false, amplified,
+                likes, bookmarks, seen, explore: false, amplified, mine: my_votes,
             }
         }).collect();
         rows.sort_by(|a, b| b.score.total_cmp(&a.score)

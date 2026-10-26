@@ -9,6 +9,7 @@ mod repo;
 mod lobby;
 mod lobby_api;
 mod auth;
+mod pages;
 mod adapters;
 
 use axum::{extract::{Path, State}, http::StatusCode, response::Html, routing::{get, post, put}, Json, Router};
@@ -56,6 +57,9 @@ pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/api/feeds", get(list_feeds))
+        .route("/api/classify", post(classify_texts))
+        .route("/dev", get(pages::dev))
+        .route("/lobbies/{id}", get(pages::lobby))
         .route("/api/ingest", post(ingest_candidates))
         .route("/api/users/{user}/publishing", put(set_publishing))
         .route("/api/users/{user}/feed", get(user_feed))
@@ -121,6 +125,20 @@ async fn subscribe(State(state): State<AppState>, me: AuthUser, Path(user): Path
 }
 
 pub const MAX_INGEST_BATCH: usize = 500;
+
+#[derive(Deserialize)]
+struct ClassifyRequest { texts: Vec<String> }
+
+/// Labels the server would give each text (stateless, public). Lets clients split a feed
+/// into the same categories the server uses.
+async fn classify_texts(Json(r): Json<ClassifyRequest>) -> Result<Json<serde_json::Value>, StatusCode> {
+    if r.texts.len() > MAX_INGEST_BATCH { return Err(StatusCode::PAYLOAD_TOO_LARGE); }
+    let results: Vec<_> = r.texts.iter().map(|t| {
+        let t: String = t.chars().take(2000).collect();
+        serde_json::json!({ "labels": classify::classify(&t, &|_| true), "finance": classify::is_finance(&t) })
+    }).collect();
+    Ok(Json(serde_json::json!({ "results": results })))
+}
 
 /// 404 unknown user, 403 user has not opted in to publishing.
 async fn ingest_candidates(State(state): State<AppState>, me: AuthUser, Json(request): Json<model::IngestRequest>) -> Result<Json<model::IngestReport>, StatusCode> {
