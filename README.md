@@ -100,3 +100,21 @@ X_USER_TOKEN=... ./scripts/dev.sh --source x             # your real X home time
 5. **Live**: the server stays up. Open `/dev?users=...` (printed) to sign in as any test account, then `/lobbies/<id>` to watch the ranking update over SSE and vote yourself.
 
 Run `python -m trend_liker.devsim --help` for all options. The `/dev` page exists only when `AUTH_DEV_LOGIN=1`.
+
+## Connector: use trend-liker from Claude (`trend_liker/mcp_server.py`)
+
+An MCP server that lets Claude read and act in the service as one signed-in user: `whoami`, `list_public_feeds`, `my_home_feed`, `subscribe_feed`, `set_publishing`, `list_lobbies`, `lobby_feed`, `create_lobby`, `join_lobby`, `leave_lobby`, `vote`, `contribute_posts` (share posts Claude got elsewhere, e.g. from another connector), `classify_text`, plus `run_simulation` in dev mode. Read-only tools are annotated as such; `set_publishing` and `leave_lobby` are marked destructive (they withdraw contributions). The server's instructions tell Claude to vote, share or change publishing only when the user asks.
+
+```
+pip install -e .        # provides the trend-liker-mcp command
+
+# Claude Code, against a local dev server (./scripts/dev.sh, or AUTH_DEV_LOGIN=1 cargo run):
+claude mcp add trend-liker -e TRENDLIKER_DEV_USER=dev-you -- trend-liker-mcp
+
+# As a real user: get a session token from Sign in with X (trend_liker.auth.sign_in_with_x)
+claude mcp add trend-liker -e TRENDLIKER_URL=https://your-host -e TRENDLIKER_TOKEN=... -- trend-liker-mcp
+```
+
+Claude Desktop takes the same command and environment in its MCP config. `trend-liker-mcp --http --port 8765` serves streamable HTTP at `http://127.0.0.1:8765/mcp` instead of stdio; it binds to localhost only, because anyone who can reach it acts as the connector's user.
+
+Not yet: a claude.ai custom connector needs the MCP server at a public HTTPS URL with its own OAuth sign-in, so each person connects as themselves. Today the connector holds one user's session token.
