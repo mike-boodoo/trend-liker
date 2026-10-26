@@ -100,6 +100,10 @@ class HttpXClient:
         ]
         return Page(posts, body.get("meta", {}).get("next_token"))
 
+    async def me(self) -> dict:
+        """The authenticated user ({id, username, ...}); needs a user-context token."""
+        return (await self._request("GET", "/2/users/me"))["data"]
+
     async def like(self, user_id: str, post_id: str) -> bool:
         body = await self._request(
             "POST", f"/2/users/{user_id}/likes", json={"tweet_id": post_id}

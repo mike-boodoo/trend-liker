@@ -81,3 +81,22 @@ Every API that acts for a user takes the user from the session; a request that n
   ```
 
 Cross-site request forgery: the session cookie is `SameSite=Lax`, state-changing routes need JSON bodies or non-simple methods, and the server sends no CORS headers, so other sites can't make those requests with your cookie. Pending sign-ins are held in memory, so a sign-in can't span a server restart or multiple instances.
+
+## Dev testing flow: see your own feed through the service
+
+```
+./scripts/dev.sh                                         # mock feed, 2 other test accounts, 3 rounds
+./scripts/dev.sh --policy scripts/policy-personal.json   # weight like-minded votes more
+./scripts/dev.sh --source file --file my-feed.json       # a JSON list of posts, or an X timeline response
+X_USER_TOKEN=... ./scripts/dev.sh --source x             # your real X home timeline
+```
+
+`scripts/dev.sh` starts the server in dev mode (dev sign-in on, in-memory storage unless `DEV_DATABASE_URL` is set) and runs `python -m trend_liker.devsim`:
+
+1. **Your feed** comes from a seeded mock (`trend_liker/mock_feed.py`), a file, or your real timeline (`X_USER_TOKEN` must be a user-context OAuth 2.0 token with `tweet.read users.read`; it's used only by this local tool and never sent to the server).
+2. **Split by category**: `POST /api/classify` labels each post the way the server will, and each label's slice becomes a test account (`dev-you-ai`, `dev-you-rust`, ... plus `dev-you-other` for unlabeled posts) that joins a new lobby, so each part of your feed is ranked as if it were someone else's. `--overlap` lets a post with several labels join every matching slice. `--others N` adds test accounts with their own mock feeds, which include some of your posts to exercise the cross-feed overlap signal.
+3. **Simulated rounds**: each test account reads the top of its lobby feed and likes or bookmarks what matches its interests, sometimes skipping what doesn't (seeded, so runs are reproducible).
+4. **Output**: your view with each post's movement since before any votes, how each slice sees the lobby, and an HTML report (`--report`, default `devsim-report.html`).
+5. **Live**: the server stays up. Open `/dev?users=...` (printed) to sign in as any test account, then `/lobbies/<id>` to watch the ranking update over SSE and vote yourself.
+
+Run `python -m trend_liker.devsim --help` for all options. The `/dev` page exists only when `AUTH_DEV_LOGIN=1`.

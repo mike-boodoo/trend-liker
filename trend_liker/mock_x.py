@@ -29,6 +29,8 @@ class MockXServer:
             headers = {"retry-after": "0"} if code == 429 else {}
             return httpx.Response(code, json={"title": "forced"}, headers=headers)
 
+        if req.url.path == "/2/users/me":
+            return httpx.Response(200, json={"data": {"id": "me", "username": "mock_me"}})
         parts = req.url.path.strip("/").split("/")  # 2 users {id} ...
         if len(parts) >= 4 and parts[:2] == ["2", "users"]:
             uid = parts[2]
