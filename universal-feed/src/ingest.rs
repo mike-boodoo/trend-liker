@@ -89,7 +89,7 @@ mod tests {
         let store = Store::new();
         seed(&store);
         store.users.write().unwrap().get_mut("demo").unwrap().publish_opt_in = true;
-        store.insert_user(UserSettings { user_id: "bob".into(), public_feeds: vec![], publish_opt_in: true });
+        store.insert_user(UserSettings { user_id: "bob".into(), public_feeds: vec![], publish_opt_in: true, username: None });
         store
     }
 

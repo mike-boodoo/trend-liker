@@ -45,6 +45,9 @@ pub struct UserSettings {
     /// Whether this user's content may be published into shared feeds. Off by default.
     #[serde(default)]
     pub publish_opt_in: bool,
+    /// X handle, for users who signed in with X.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,8 +72,9 @@ pub struct Candidate {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct IngestRequest {
-    /// The user whose content this is; must have opted in to publishing.
-    pub user_id: String,
+    /// Optional; must match the signed-in user if given.
+    #[serde(default)]
+    pub user_id: Option<String>,
     pub items: Vec<Candidate>,
 }
 
