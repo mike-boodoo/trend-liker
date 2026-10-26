@@ -50,6 +50,17 @@ A lobby is a "game server" for a feed. Members pool what their **own** platform 
 - **Consent**: contributing requires the publishing opt-in; opting out or leaving withdraws posts only you contributed (leaving also removes your votes). Only members can read a lobby's feed or events.
 - **Finance**: stock posts (keywords or cashtags like `$AAPL`) get no vote, overlap or affinity amplification unless the policy sets `amplify_finance`, and the Python `FeedAgent` never auto-likes them unless `Policy(like_finance=True)`. Cross-user amplification of stock tips is how pump-and-dumps work.
 
+- **Access rules** (`policy.access`): posts under a gated label are hidden from a member until they meet a rule for it, based on what they **produced** (their posts under a label that *another* member liked, bookmarked or replied to) or **consumed** (other members' posts under a label they liked, bookmarked or replied to; impressions don't count). `of` counts a different label, e.g. unlock `search` after engaging with 2 `rust` posts:
+
+  ```json
+  "access": [
+    { "label": "search", "when": { "produced": 1 } },
+    { "label": "search", "when": { "consumed": 2, "of": "rust" } }
+  ]
+  ```
+
+  Rules for one label are alternatives; both counts in one rule must hold. You always see your own posts, and the owner sees everything (moderation, and someone has to vote first so producers can earn access). Access is derived from the current pool, so it lapses if the votes or posts behind it go away. Rules that can't be met (consuming a label to see that same label), unknown labels, and rules that earn access by posting finance content are rejected with 422 and a reason. Hidden posts are absent from feeds and exploration, voting on one returns 404 like a missing post, the feed's `locked` field shows what's still locked and your progress, the public lobby profile omits the pool size, and live events carry no post IDs.
+
 Routes: `POST/GET /api/lobbies`, `GET /api/lobbies/{id}`, `PUT .../policy` (owner), `POST .../members`, `DELETE .../members/{user}`, `POST .../contribute`, `POST .../interactions` (`impression|like|bookmark|reply|skip`, `active: false` retracts), `GET .../feed`, `GET .../events`.
 
 Lobby state is in memory (like a game server's live state), so it resets on restart. Users and consent live in the Repo.

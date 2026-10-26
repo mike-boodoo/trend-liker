@@ -85,13 +85,13 @@ async def test_events_parses_sse_stream():
     stream = (
         "event: hello\ndata: {\"lobby\":\"ai\",\"version\":3}\n\n"
         ":\n\n"
-        "event: interaction\ndata: {\"lobby\":\"ai\",\"version\":4,\"kind\":\"interaction\",\"item\":\"x\"}\n\n"
+        "event: interaction\ndata: {\"lobby\":\"ai\",\"version\":4,\"kind\":\"interaction\"}\n\n"
     )
     c = LobbyClient(transport=httpx.MockTransport(
         lambda req: httpx.Response(200, headers={"content-type": "text/event-stream"}, content=stream.encode())))
     got = [e async for e in c.events("ai", "bob")]
     assert got == [("hello", {"lobby": "ai", "version": 3}),
-                   ("interaction", {"lobby": "ai", "version": 4, "kind": "interaction", "item": "x"})]
+                   ("interaction", {"lobby": "ai", "version": 4, "kind": "interaction"})]
 
 
 async def test_events_requires_membership():

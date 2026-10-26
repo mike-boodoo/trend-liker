@@ -5,7 +5,7 @@ use std::convert::Infallible;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    response::sse::{Event, KeepAlive, Sse},
+    response::{sse::{Event, KeepAlive, Sse}, IntoResponse, Response},
     routing::{delete, get, post, put},
     Json, Router,
 };
@@ -43,6 +43,14 @@ fn status(e: LobbyError) -> StatusCode {
     }
 }
 
+/// Like `status`, but tells the caller why a policy was rejected.
+fn reject(e: LobbyError) -> Response {
+    match e {
+        LobbyError::InvalidPolicy(why) => (StatusCode::UNPROCESSABLE_ENTITY, why).into_response(),
+        e => status(e).into_response(),
+    }
+}
+
 fn valid_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
@@ -68,11 +76,11 @@ struct CreateLobby {
     policy: LobbyPolicy,
 }
 
-async fn create(State(state): State<AppState>, Json(r): Json<CreateLobby>) -> Result<(StatusCode, Json<LobbyProfile>), StatusCode> {
-    if !valid_id(&r.id) { return Err(StatusCode::BAD_REQUEST); }
-    require_user(&state, &r.owner).await?;
-    let lobby = Lobby::new(&r.id, &r.name, &r.owner, r.policy).map_err(status)?;
-    let h = state.lobbies.create(lobby).ok_or(StatusCode::CONFLICT)?;
+async fn create(State(state): State<AppState>, Json(r): Json<CreateLobby>) -> Result<(StatusCode, Json<LobbyProfile>), Response> {
+    if !valid_id(&r.id) { return Err(StatusCode::BAD_REQUEST.into_response()); }
+    require_user(&state, &r.owner).await.map_err(IntoResponse::into_response)?;
+    let lobby = Lobby::new(&r.id, &r.name, &r.owner, r.policy).map_err(reject)?;
+    let h = state.lobbies.create(lobby).ok_or(StatusCode::CONFLICT.into_response())?;
     let profile = h.lobby.lock().unwrap().profile();
     Ok((StatusCode::CREATED, Json(profile)))
 }
@@ -85,15 +93,15 @@ async fn profile(State(state): State<AppState>, Path(id): Path<String>) -> Resul
 struct SetPolicy { user_id: String, policy: LobbyPolicy }
 
 /// Owner only.
-async fn set_policy(State(state): State<AppState>, Path(id): Path<String>, Json(r): Json<SetPolicy>) -> Result<Json<LobbyProfile>, StatusCode> {
-    let h = handle(&state, &id)?;
+async fn set_policy(State(state): State<AppState>, Path(id): Path<String>, Json(r): Json<SetPolicy>) -> Result<Json<LobbyProfile>, Response> {
+    let h = handle(&state, &id).map_err(IntoResponse::into_response)?;
     let (profile, version) = {
         let mut l = h.lobby.lock().unwrap();
-        if l.owner != r.user_id { return Err(StatusCode::FORBIDDEN); }
-        l.set_policy(r.policy, Utc::now()).map_err(status)?;
+        if l.owner != r.user_id { return Err(StatusCode::FORBIDDEN.into_response()); }
+        l.set_policy(r.policy, Utc::now()).map_err(reject)?;
         (l.profile(), l.version())
     };
-    h.publish(version, "policy", None);
+    h.publish(version, "policy");
     Ok(Json(profile))
 }
 
@@ -107,7 +115,7 @@ async fn join(State(state): State<AppState>, Path(id): Path<String>, Json(r): Js
         let mut l = h.lobby.lock().unwrap();
         (l.join(&r.user_id).map_err(status)?, l.profile())
     };
-    if joined { h.publish(profile.version, "member", None); }
+    if joined { h.publish(profile.version, "member"); }
     Ok(Json(profile))
 }
 
@@ -117,7 +125,7 @@ async fn leave(State(state): State<AppState>, Path((id, user)): Path<(String, St
         let mut l = h.lobby.lock().unwrap();
         (l.leave(&user).map_err(status)?, l.version())
     };
-    h.publish(version, "member", None);
+    h.publish(version, "member");
     Ok(Json(json!({ "withdrawn": withdrawn })))
 }
 
@@ -133,7 +141,7 @@ async fn contribute(State(state): State<AppState>, Path(id): Path<String>, Json(
         let mut l = h.lobby.lock().unwrap();
         (l.contribute(&r.user_id, r.items, Utc::now()).map_err(status)?, l.version())
     };
-    h.publish(version, "contribution", None);
+    h.publish(version, "contribution");
     // Consent may have been withdrawn between the check and the insert; if so, undo.
     if !require_user(&state, &r.user_id).await?.publish_opt_in {
         state.lobbies.withdraw_everywhere(&r.user_id);
@@ -159,7 +167,7 @@ async fn interact(State(state): State<AppState>, Path(id): Path<String>, Json(r)
         l.interact(&r.user_id, r.item_id, r.kind, r.active, Utc::now()).map_err(status)?;
         l.version()
     };
-    h.publish(version, "interaction", Some(r.item_id));
+    h.publish(version, "interaction");
     Ok(Json(json!({ "version": version })))
 }
 
@@ -172,7 +180,7 @@ async fn feed(State(state): State<AppState>, Path(id): Path<String>, Query(q): Q
     let l = h.lobby.lock().unwrap();
     if !l.is_member(&q.user) { return Err(StatusCode::FORBIDDEN); }
     let items: Vec<Ranked> = l.rank(&q.user, Utc::now(), q.limit.clamp(1, MAX_FEED_LIMIT));
-    Ok(Json(json!({ "lobby": l.id, "user": q.user, "version": l.version(), "items": items })))
+    Ok(Json(json!({ "lobby": l.id, "user": q.user, "version": l.version(), "items": items, "locked": l.locks(&q.user) })))
 }
 
 #[derive(Deserialize)]

@@ -14,6 +14,9 @@ const KEYWORDS: &[(&str, &[&str])] = &[
                   "bearish", "nasdaq", "portfolio", "trading", "ticker", "etf", "options"]),
 ];
 
+/// Every label `classify` can produce.
+pub fn labels() -> impl Iterator<Item = &'static str> { KEYWORDS.iter().map(|(cat, _)| *cat) }
+
 fn tokens(text: &str) -> Vec<String> {
     text.split(|c: char| !c.is_alphanumeric())
         .filter(|t| !t.is_empty())

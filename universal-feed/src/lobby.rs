@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
-use crate::classify::{classify, is_finance};
+use crate::classify::{classify, is_finance, labels};
 use crate::ingest::{clamp_score, prepare_text};
 use crate::model::{Candidate, Source};
 
@@ -60,6 +60,8 @@ pub struct LobbyPolicy {
     pub exploration: f64,
     /// Finance posts get no vote or overlap amplification unless enabled (pump-and-dump risk).
     pub amplify_finance: bool,
+    /// Posts carrying a label that has rules are hidden from a member until one of its rules is met.
+    pub access: Vec<AccessRule>,
     pub max_members: usize,
     pub max_pool: usize,
 }
@@ -69,7 +71,7 @@ impl Default for LobbyPolicy {
         Self {
             topics: vec![], weights: Weights::default(), half_life_secs: 3600.0, affinity: 0.5,
             overlap_prior: 0.25, seen_penalty: 0.5, max_same_author: 2, exploration: 0.1,
-            amplify_finance: false, max_members: 400, max_pool: 2000,
+            amplify_finance: false, access: vec![], max_members: 400, max_pool: 2000,
         }
     }
 }
@@ -85,8 +87,64 @@ impl LobbyPolicy {
         if self.max_same_author == 0 || self.max_members == 0 || self.max_pool == 0 {
             return Err("max_same_author, max_members and max_pool must be >= 1".into());
         }
+        for r in &self.access { r.validate()?; }
         Ok(())
     }
+}
+
+/// Unlock `label` once the member's record under `when.of` (default: `label`) meets `when`.
+/// Several rules for one label are alternatives; both counts in one rule are required together.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AccessRule {
+    pub label: String,
+    pub when: Condition,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Condition {
+    /// Posts you contributed under `of` that another member liked, bookmarked or replied to.
+    pub produced: Option<usize>,
+    /// Other members' posts under `of` that you liked, bookmarked or replied to.
+    pub consumed: Option<usize>,
+    pub of: Option<String>,
+}
+
+impl AccessRule {
+    fn counted_label(&self) -> &str { self.when.of.as_deref().unwrap_or(&self.label) }
+
+    fn validate(&self) -> Result<(), String> {
+        for l in [self.label.as_str(), self.counted_label()] {
+            if !labels().any(|k| k == l) { return Err(format!("unknown label {l:?}")); }
+        }
+        if self.when.produced.is_none() && self.when.consumed.is_none() {
+            return Err(format!("rule for {:?} needs `produced` or `consumed`", self.label));
+        }
+        if self.when.consumed.is_some() && self.counted_label() == self.label {
+            return Err(format!("{:?} can't be unlocked by consuming {0:?}: it's hidden until unlocked", self.label));
+        }
+        if self.when.produced.is_some() && self.counted_label() == "finance" {
+            return Err("access can't be earned by posting finance content (it rewards stock tips)".into());
+        }
+        Ok(())
+    }
+
+    fn met(&self, ledger: &HashMap<String, Tally>) -> bool {
+        let t = ledger.get(self.counted_label()).copied().unwrap_or_default();
+        self.when.produced.is_none_or(|n| t.produced >= n) && self.when.consumed.is_none_or(|n| t.consumed >= n)
+    }
+}
+
+/// A member's record under one label, derived from the current pool.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub struct Tally { pub produced: usize, pub consumed: usize }
+
+/// A label the viewer can't see yet, what unlocks it, and their progress.
+#[derive(Debug, Clone, Serialize)]
+pub struct Locked {
+    pub label: String,
+    pub rules: Vec<AccessRule>,
+    pub progress: HashMap<String, Tally>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -142,7 +200,8 @@ pub struct LobbyProfile {
     pub name: String,
     pub owner: String,
     pub members: usize,
-    pub pool: usize,
+    /// Omitted when access rules are set: the total would reveal hidden posts.
+    pub pool: Option<usize>,
     pub version: u64,
     pub policy: LobbyPolicy,
 }
@@ -175,7 +234,7 @@ impl Lobby {
     pub fn profile(&self) -> LobbyProfile {
         LobbyProfile {
             id: self.id.clone(), name: self.name.clone(), owner: self.owner.clone(), members: self.members.len(),
-            pool: self.items.len(), version: self.version, policy: self.policy.clone(),
+            pool: self.policy.access.is_empty().then_some(self.items.len()), version: self.version, policy: self.policy.clone(),
         }
     }
 
@@ -267,7 +326,9 @@ impl Lobby {
     /// Record a vote (or retract it with `active = false`). Any interaction counts as seen.
     pub fn interact(&mut self, user: &str, item: Uuid, kind: Kind, active: bool, now: DateTime<Utc>) -> Result<(), LobbyError> {
         if !self.is_member(user) { return Err(LobbyError::NotMember); }
-        if !self.items.contains_key(&item) { return Err(LobbyError::NoItem); }
+        // Hidden posts are indistinguishable from missing ones.
+        let locked = self.locked_labels(user);
+        if !self.items.get(&item).is_some_and(|i| self.can_see(user, i, &locked)) { return Err(LobbyError::NoItem); }
         let marks = self.votes.entry(user.into()).or_default().entry(item).or_default();
         marks.entry(Kind::Impression).or_insert(now);
         if kind != Kind::Impression {
@@ -313,12 +374,63 @@ impl Lobby {
         sims
     }
 
-    /// The pool as `user` should see it right now.
+    /// The member's produced/consumed record per label. Only votes from *other* members count
+    /// toward `produced`, and only votes on *other* members' posts count toward `consumed`.
+    pub fn ledger(&self, user: &str) -> HashMap<String, Tally> {
+        let positive = |m: &Marks| [Kind::Like, Kind::Bookmark, Kind::Reply].iter().any(|k| m.contains_key(k));
+        let mut ledger: HashMap<String, Tally> = HashMap::new();
+        for i in self.items.values() {
+            let mine = i.contributors.contains(user);
+            let produced = mine && self.votes.iter().any(|(w, v)| w != user && v.get(&i.id).is_some_and(positive));
+            let consumed = !mine && self.votes.get(user).and_then(|v| v.get(&i.id)).is_some_and(positive);
+            if !(produced || consumed) { continue; }
+            for label in &i.categories {
+                let t = ledger.entry(label.clone()).or_default();
+                t.produced += produced as usize;
+                t.consumed += consumed as usize;
+            }
+        }
+        ledger
+    }
+
+    /// Labels hidden from `user`. The owner sees everything (moderation, and someone has to
+    /// be able to vote first so producers can earn access).
+    fn locked_labels(&self, user: &str) -> HashSet<String> {
+        if self.policy.access.is_empty() || user == self.owner { return HashSet::new(); }
+        let ledger = self.ledger(user);
+        self.policy.access.iter().map(|r| r.label.clone()).collect::<HashSet<_>>().into_iter()
+            .filter(|l| !self.policy.access.iter().any(|r| &r.label == l && r.met(&ledger)))
+            .collect()
+    }
+
+    /// Your own contributions are always visible to you.
+    fn can_see(&self, user: &str, item: &PoolItem, locked: &HashSet<String>) -> bool {
+        locked.is_empty() || item.contributors.contains(user) || !item.categories.iter().any(|c| locked.contains(c))
+    }
+
+    /// What `user` can't see yet and how close they are.
+    pub fn locks(&self, user: &str) -> Vec<Locked> {
+        let ledger = self.ledger(user);
+        let mut out: Vec<Locked> = self.locked_labels(user).into_iter().map(|label| {
+            let rules: Vec<AccessRule> = self.policy.access.iter().filter(|r| r.label == label).cloned().collect();
+            let progress = rules.iter().map(|r| {
+                let l = r.counted_label().to_string();
+                let t = ledger.get(&l).copied().unwrap_or_default();
+                (l, t)
+            }).collect();
+            Locked { label, rules, progress }
+        }).collect();
+        out.sort_by(|a, b| a.label.cmp(&b.label));
+        out
+    }
+
+    /// The pool as `user` should see it right now: only posts they may see, ranked.
     pub fn rank(&self, user: &str, now: DateTime<Utc>, limit: usize) -> Vec<Ranked> {
         let sims = self.similarities(user, now);
         let alpha = if sims.is_empty() { 0.0 } else { self.policy.affinity };
         let mine = self.votes.get(user);
-        let mut rows: Vec<Ranked> = self.items.values().map(|i| {
+        let locked = self.locked_labels(user);
+        let mut rows: Vec<Ranked> = self.items.values().filter(|i| self.can_see(user, i, &locked)).map(|i| {
             let amplified = !i.finance || self.policy.amplify_finance;
             let (mut global, mut personal, mut likes, mut bookmarks) = (0.0, 0.0, 0, 0);
             for (voter, v) in &self.votes {
@@ -379,13 +491,13 @@ impl Lobby {
     }
 }
 
-/// Broadcast to everyone watching a lobby. Voters are not identified.
+/// Broadcast to everyone watching a lobby. It names neither the voter nor the post, so it can't
+/// reveal posts a watcher isn't allowed to see; clients refetch their own feed.
 #[derive(Debug, Clone, Serialize)]
 pub struct LobbyEvent {
     pub lobby: String,
     pub version: u64,
     pub kind: String,
-    pub item: Option<Uuid>,
 }
 
 pub struct LobbyHandle {
@@ -396,9 +508,9 @@ pub struct LobbyHandle {
 
 impl LobbyHandle {
     /// Must not be called while holding `lobby`'s lock for long; it doesn't take it.
-    pub fn publish(&self, version: u64, kind: &str, item: Option<Uuid>) {
+    pub fn publish(&self, version: u64, kind: &str) {
         // No receivers is fine: nobody is watching.
-        let _ = self.events.send(LobbyEvent { lobby: self.id.clone(), version, kind: kind.into(), item });
+        let _ = self.events.send(LobbyEvent { lobby: self.id.clone(), version, kind: kind.into() });
     }
 }
 
@@ -431,7 +543,7 @@ impl Lobbies {
         let mut total = 0;
         for h in self.all() {
             let (n, version) = { let mut l = h.lobby.lock().unwrap(); (l.withdraw(user), l.version()) };
-            if n > 0 { h.publish(version, "withdrawal", None); }
+            if n > 0 { h.publish(version, "withdrawal"); }
             total += n;
         }
         total
@@ -562,6 +674,79 @@ mod tests {
         assert!(ranked.iter().all(|r| r.personal == 0.0), "c has no amplifiable votes, so no personalization");
         let g = |e: &str| ranked.iter().find(|r| r.item.external_id == e).unwrap().score;
         assert_eq!(g("pa"), g("pb"));
+    }
+
+    fn rule(label: &str, produced: Option<usize>, consumed: Option<usize>, of: Option<&str>) -> AccessRule {
+        AccessRule { label: label.into(), when: Condition { produced, consumed, of: of.map(Into::into) } }
+    }
+    fn gated(access: Vec<AccessRule>) -> LobbyPolicy { LobbyPolicy { access, ..quiet() } }
+    fn visible(l: &Lobby, user: &str) -> Vec<String> {
+        let mut v = order(l, user, t0());
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn produced_access_needs_a_vote_from_someone_else() {
+        let mut l = lobby_with(gated(vec![rule("search", Some(1), None, None)]), &["a", "b"]);
+        l.contribute("a", vec![cand("pa", "x", "vector search tricks"), cand("open", "y", "rust tips")], t0()).unwrap();
+        l.contribute("b", vec![cand("pb", "z", "hnsw retrieval")], t0()).unwrap();
+        assert_eq!(visible(&l, "b"), ["open", "pb"], "own posts visible, others' search posts hidden");
+        assert_eq!(l.interact("b", id_of(&l, "pa"), Kind::Like, true, t0()), Err(LobbyError::NoItem));
+
+        l.interact("a", id_of(&l, "pa"), Kind::Like, true, t0()).unwrap();
+        assert_eq!(visible(&l, "a"), ["open", "pa"], "liking your own post earns nothing");
+        assert_eq!(l.locks("a")[0].progress["search"], Tally { produced: 0, consumed: 0 });
+
+        assert_eq!(visible(&l, "owner"), ["open", "pa", "pb"], "owner moderates and seeds");
+        l.interact("owner", id_of(&l, "pa"), Kind::Like, true, t0()).unwrap();
+        assert_eq!(visible(&l, "a"), ["open", "pa", "pb"]);
+        assert!(l.locks("a").is_empty());
+        l.interact("a", id_of(&l, "pb"), Kind::Bookmark, true, t0()).unwrap();
+        assert_eq!(visible(&l, "b"), ["open", "pa", "pb"], "a's vote unlocks b in turn");
+
+        // Access is derived from the pool: losing the voted post re-locks.
+        l.interact("owner", id_of(&l, "pa"), Kind::Like, false, t0()).unwrap();
+        assert_eq!(visible(&l, "a"), ["open", "pa"]);
+    }
+
+    #[test]
+    fn consumed_access_across_labels() {
+        let mut l = lobby_with(gated(vec![rule("search", None, Some(2), Some("rust"))]), &["a", "b"]);
+        l.contribute("a", vec![cand("r1", "x", "rust tips"), cand("r2", "y", "cargo tricks"), cand("s1", "z", "vector search")], t0()).unwrap();
+        l.contribute("b", vec![cand("r3", "w", "tokio notes")], t0()).unwrap();
+        l.interact("b", id_of(&l, "r3"), Kind::Like, true, t0()).unwrap();
+        l.interact("b", id_of(&l, "r1"), Kind::Like, true, t0()).unwrap();
+        l.interact("b", id_of(&l, "r2"), Kind::Impression, true, t0()).unwrap();
+        assert_eq!(l.locks("b")[0].progress["rust"].consumed, 1, "own posts and bare impressions don't count");
+        assert!(!visible(&l, "b").contains(&"s1".to_string()));
+        l.interact("b", id_of(&l, "r2"), Kind::Reply, true, t0()).unwrap();
+        assert!(visible(&l, "b").contains(&"s1".to_string()));
+    }
+
+    #[test]
+    fn hidden_posts_dont_leak_through_exploration_or_profile() {
+        let policy = LobbyPolicy { exploration: 0.5, ..gated(vec![rule("search", Some(1), None, None)]) };
+        let mut l = lobby_with(policy, &["a", "c"]);
+        let mut posts: Vec<_> = (0..40).map(|i| cand(&format!("s{i}"), &format!("au{i}"), "vector search")).collect();
+        posts.push(cand("open", "y", "rust tips"));
+        l.contribute("a", posts, t0()).unwrap();
+        let feed = l.rank("c", t0(), 10);
+        assert_eq!(feed.len(), 1);
+        assert!(!feed[0].explore && feed[0].item.external_id == "open");
+        assert_eq!(l.profile().pool, None);
+        assert_eq!(lobby_with(quiet(), &[]).profile().pool, Some(0), "no rules, nothing to hide");
+    }
+
+    #[test]
+    fn access_rule_validation() {
+        let check = |r: AccessRule| gated(vec![r]).validate();
+        assert!(check(rule("nope", Some(1), None, None)).unwrap_err().contains("unknown label"));
+        assert!(check(rule("search", None, Some(1), None)).unwrap_err().contains("hidden until unlocked"));
+        assert!(check(rule("search", None, None, None)).is_err());
+        assert!(check(rule("ai", Some(1), None, Some("finance"))).unwrap_err().contains("stock tips"));
+        assert!(check(rule("finance", Some(1), None, None)).is_err());
+        assert!(check(rule("finance", None, Some(3), Some("rust"))).is_ok(), "finance can be gated on consumption");
     }
 
     #[test]
