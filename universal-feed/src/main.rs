@@ -10,6 +10,8 @@ mod lobby;
 mod lobby_api;
 mod auth;
 mod pages;
+mod oauth;
+mod xapi;
 mod adapters;
 
 use axum::{extract::{Path, State}, http::StatusCode, response::Html, routing::{get, post, put}, Json, Router};
@@ -19,7 +21,7 @@ use auth::AuthUser;
 use repo::{Ingested, Repo, Subscribed};
 use store::Store;
 
-#[derive(Clone)] pub struct AppState { pub repo: Arc<dyn Repo>, pub lobbies: Arc<lobby::Lobbies>, pub auth: Arc<auth::Auth> }
+#[derive(Clone)] pub struct AppState { pub repo: Arc<dyn Repo>, pub lobbies: Arc<lobby::Lobbies>, pub auth: Arc<auth::Auth>, pub oauth: Arc<oauth::OAuth> }
 #[derive(Debug, Deserialize)] struct SubscriptionRequest { feed: String }
 
 #[tokio::main]
@@ -47,7 +49,12 @@ async fn main() {
         (_, true) => eprintln!("WARNING: AUTH_DEV_LOGIN=1 lets anyone sign in as anyone. Never enable it outside local development."),
         (None, false) => eprintln!("WARNING: no sign-in configured (set X_CLIENT_ID); every API that needs a user will return 401."),
     }
-    let state = AppState { repo, lobbies: Arc::new(lobby::Lobbies::default()), auth: Arc::new(auth) };
+    if auth.x.is_some() && auth.cipher.is_none() {
+        eprintln!("NOTE: TOKEN_ENCRYPTION_KEY is not set, so X tokens aren't stored and timeline features are off.");
+    }
+    let oauth = oauth::OAuth::new(oauth::OAuthConfig::from_env());
+    println!("Connector sign-in (OAuth issuer): {}; MCP resources: {}", oauth.config.issuer, oauth.config.resources.join(", "));
+    let state = AppState { repo, lobbies: Arc::new(lobby::Lobbies::default()), auth: Arc::new(auth), oauth: Arc::new(oauth) };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await.expect("failed to bind localhost:3000");
     println!("Universal Feed Server\nhttp://localhost:3000");
     axum::serve(listener, app(state)).await.expect("server failed");
@@ -67,6 +74,8 @@ pub fn app(state: AppState) -> Router {
         .route("/api/users/{user}/subscriptions", post(subscribe))
         .merge(lobby_api::routes())
         .merge(auth::routes())
+        .merge(oauth::routes())
+        .merge(xapi::routes())
         .with_state(state)
 }
 

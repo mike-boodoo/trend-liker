@@ -19,3 +19,4 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 sha2 = "0.10"
 base64 = "0.22"
 getrandom = "0.3"
+aes-gcm = "0.10"

@@ -2,8 +2,15 @@
 
     python -m trend_liker.mcp_server                       # stdio (Claude Code, Claude Desktop)
     python -m trend_liker.mcp_server --http --port 8765    # streamable HTTP on 127.0.0.1
+    python -m trend_liker.mcp_server --http --public-url https://mcp.example.com
+                                                           # hosted connector (e.g. claude.ai): each
+                                                           # person signs in with X via OAuth
 
-The connector acts as one signed-in user of the universal-feed server:
+Hosted mode: callers bring an OAuth access token issued by the universal-feed server, and each
+call acts as that person. TRENDLIKER_ISSUER is that server's public URL, which clients are sent
+to for sign-in (default: TRENDLIKER_URL, which may be an internal address behind a proxy).
+
+Local modes act as one signed-in user of the universal-feed server:
 
     TRENDLIKER_URL       server URL (default http://127.0.0.1:3000)
     TRENDLIKER_TOKEN     a session token from Sign in with X (see trend_liker.auth), or
@@ -19,8 +26,18 @@ import os
 from typing import Any, Literal
 
 import httpx
+import hashlib
+import statistics
+import time
+from collections import Counter
+from urllib.parse import urlparse
+
+from mcp.server.auth.middleware.auth_context import get_access_token
+from mcp.server.auth.provider import AccessToken, TokenVerifier
+from mcp.server.auth.settings import AuthSettings
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 
 from .auth import dev_login
@@ -39,7 +56,11 @@ as the signed-in user shown by `whoami`.
 Votes are visible to other members as ranking changes, so vote only when the user asks you to. \
 Contributing posts or turning publishing on shares the user's content with others; turning \
 publishing off withdraws everything they contributed. Confirm those with the user first. \
-Finance posts are never amplified by votes unless the lobby's owner enabled it."""
+Finance posts are never amplified by votes unless the lobby's owner enabled it.
+
+`analyze_my_feed` and `my_x_timeline` read the user's own X home timeline (what X is showing \
+them). That is private to the user: summarize it for them, and never contribute or publish it \
+unless they explicitly ask."""
 
 READ = ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False)
 
@@ -67,13 +88,95 @@ def _item(i: dict) -> dict:
                               "contributors", "seen", "mine", "explore", "amplified") if k in i}
 
 
+class ServiceTokenVerifier(TokenVerifier):
+    """Accepts a bearer token if the universal-feed server says it's a live session. Results are
+    cached briefly (by token hash) so each MCP request doesn't cost an extra round trip."""
+
+    def __init__(self, base_url: str, resource: str, transport: httpx.AsyncBaseTransport | None = None,
+                 ttl: float = 30.0):
+        self.base_url, self.resource, self.transport, self.ttl = base_url, resource, transport, ttl
+        self._cache: dict[str, tuple[float, str | None]] = {}
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        key = hashlib.sha256(token.encode()).hexdigest()
+        hit = self._cache.get(key)
+        if hit and hit[0] > time.monotonic():
+            user = hit[1]
+        else:
+            async with httpx.AsyncClient(base_url=self.base_url, transport=self.transport, timeout=10.0) as c:
+                r = await c.get("/api/me", headers={"Authorization": f"Bearer {token}"})
+            user = r.json()["user_id"] if r.status_code == 200 else None
+            if len(self._cache) > 10_000:
+                self._cache.clear()
+            self._cache[key] = (time.monotonic() + self.ttl, user)
+        if user is None:
+            return None
+        return AccessToken(token=token, client_id="trend-liker", scopes=["feeds"], subject=user, resource=self.resource)
+
+
+def analyze(posts: list[dict], labels: list[list[str]]) -> dict:
+    """Patterns in a feed: what it's about, who dominates it, how concentrated it is, and what
+    gets engagement. Plus an evenly spread sample for reading the posts themselves."""
+    n = len(posts)
+    if n == 0:
+        return {"posts": 0, "note": "X returned no posts for this home timeline."}
+    cats = Counter(l for ls in labels for l in ls)
+    first = Counter((ls[0] if ls else "unlabeled") for ls in labels)
+    authors = Counter(p.get("author_username") or p.get("author_id") or "?" for p in posts)
+    by_author_labels: dict[str, Counter] = {}
+    for p, ls in zip(posts, labels):
+        by_author_labels.setdefault(p.get("author_username") or p.get("author_id") or "?", Counter()).update(ls or ["unlabeled"])
+    likes = [int(p.get("like_count", 0)) for p in posts]
+    times = sorted(t for t in (p.get("created_at") for p in posts) if t)
+    top5 = sum(c for _, c in authors.most_common(5))
+    step = max(1, n // 40)
+    return {
+        "posts": n,
+        "authors": len(authors),
+        "time_span": {"oldest": times[0], "newest": times[-1]} if times else None,
+        "topics": [{"label": l, "posts": c, "share": round(c / n, 3)} for l, c in cats.most_common()],
+        "unlabeled_share": round(sum(1 for ls in labels if not ls) / n, 3),
+        "finance_share": round(sum(1 for ls in labels if "finance" in ls) / n, 3),
+        "top_authors": [{"author": a, "posts": c, "mostly": by_author_labels[a].most_common(1)[0][0]}
+                        for a, c in authors.most_common(10)],
+        "concentration": {"top5_authors_share": round(top5 / n, 3),
+                          "note": "share of the feed from its 5 most frequent accounts"},
+        "engagement": {"median_likes": statistics.median(likes),
+                       "most_liked": [{"text": p["text"][:200], "author": p.get("author_username"), "likes": p.get("like_count", 0),
+                                       "url": p.get("url")} for p in sorted(posts, key=lambda p: -int(p.get("like_count", 0)))[:5]]},
+        "as_lobby_slices": dict(first.most_common()),
+        "protected_posts": sum(1 for p in posts if p.get("protected")),
+        "sample": [{"text": posts[i]["text"][:280], "author": posts[i].get("author_username"), "labels": labels[i],
+                    "likes": posts[i].get("like_count", 0)} for i in range(0, n, step)][:40],
+    }
+
+
 def build_server(base_url: str = DEFAULT_URL, token: str | None = None, dev_user: str | None = None,
-                 transport: httpx.AsyncBaseTransport | None = None) -> MCPServer:
+                 transport: httpx.AsyncBaseTransport | None = None, public_url: str | None = None,
+                 issuer_url: str | None = None) -> MCPServer:
+    """`public_url` turns on hosted mode: OAuth with the universal-feed server as the
+    authorization server, each request acting as its own caller (`token`/`dev_user` ignored)."""
+    hosted = public_url is not None
+    auth_kw: dict[str, Any] = {}
+    if hosted:
+        resource = public_url.rstrip("/") + "/mcp"
+        auth_kw = {
+            "token_verifier": ServiceTokenVerifier(base_url, resource, transport),
+            # Tokens are this service's sessions (not bound to one MCP URL), so the verifier is the check.
+            "auth": AuthSettings(issuer_url=issuer_url or base_url, resource_server_url=resource, required_scopes=None,
+                                 validate_token_resource=False),
+        }
+        token, dev_user = None, None
     server = MCPServer(name="trend-liker", title="trend-liker feeds and lobbies", instructions=INSTRUCTIONS,
-                       version="0.1.0")
+                       version="0.2.0", **auth_kw)
     state: dict[str, Any] = {"token": token}
 
     async def session_token() -> str | None:
+        if hosted:
+            caller = get_access_token()
+            if caller is None:
+                raise ToolError("no signed-in caller")
+            return caller.token
         if state["token"] is None and dev_user:
             state["token"] = await dev_login(dev_user, base_url, transport)
         return state["token"]
@@ -203,6 +306,58 @@ def build_server(base_url: str = DEFAULT_URL, token: str | None = None, dev_user
             return await lc.contribute(lobby, (await me(fu))["user_id"], parsed)
         return await call(go)
 
+    async def x_get(fu: ForUsClient, path: str, **params) -> dict:
+        r = await fu._http.get(path, params=params, timeout=60.0)
+        if r.status_code == 409:
+            raise ToolError("X isn't connected for this account (or the connection expired): "
+                            "sign in with X again, then retry. " + r.json().get("detail", ""))
+        if r.status_code == 429:
+            raise ToolError(f"X rate limit reached; try again in {r.headers.get('retry-after', 'a few')} seconds")
+        if r.status_code >= 400:
+            raise ForUsError(r.status_code, r.text)
+        return r.json()
+
+    @server.tool(annotations=READ)
+    async def x_connection() -> dict:
+        """Whether the user's X account is connected, so their home timeline can be read."""
+        return await call(lambda fu, lc: x_get(fu, "/api/me/x"))
+
+    @server.tool(annotations=ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=False,
+                                             open_world_hint=True))
+    async def my_x_timeline(limit: int = 50) -> dict:
+        """The posts X is feeding the user right now (their home timeline, newest first, up to 800):
+        text, author, time, likes/reposts/replies, link. Private to the user."""
+        return await call(lambda fu, lc: x_get(fu, "/api/me/x/timeline", limit=max(1, min(limit, 800))))
+
+    @server.tool(annotations=ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=False,
+                                             open_world_hint=True))
+    async def analyze_my_feed(limit: int = 200) -> dict:
+        """Analyze the posts X is feeding the user: topics (the service's labels), which accounts
+        dominate and how concentrated the feed is, what gets engagement, finance share, how a lobby
+        would split it, and a spread-out sample of posts to read. Use it to explain the user's feed
+        to them; it's private, so don't share it elsewhere unless they ask."""
+        async def go(fu, lc):
+            tl = await x_get(fu, "/api/me/x/timeline", limit=max(1, min(limit, 800)))
+            posts = tl["posts"]
+            labels: list[list[str]] = []
+            for i in range(0, len(posts), 500):
+                r = await fu._http.post("/api/classify", json={"texts": [p["text"] for p in posts[i : i + 500]]})
+                r.raise_for_status()
+                labels += [x["labels"] for x in r.json()["results"]]
+            return analyze(posts, labels)
+        return await call(go)
+
+    @server.tool(annotations=_write(destructive=True, idempotent=True))
+    async def disconnect_x() -> dict:
+        """Forget the user's stored X connection (and revoke it at X). Timeline tools stop working
+        until they sign in with X again. Confirm with the user first."""
+        async def go(fu, lc):
+            r = await fu._http.delete("/api/me/x")
+            if r.status_code >= 400:
+                raise ForUsError(r.status_code, r.text)
+            return r.json()
+        return await call(go)
+
     @server.tool(annotations=READ)
     async def classify_text(texts: list[str]) -> dict:
         """The labels the service would give each text (e.g. ai, rust, finance), as used for feeds,
@@ -213,7 +368,7 @@ def build_server(base_url: str = DEFAULT_URL, token: str | None = None, dev_user
             return r.json()["results"]
         return {"results": await call(go)}
 
-    if dev_user:
+    if dev_user and not hosted:
         @server.tool(annotations=_write())
         async def run_simulation(rounds: int = 3, others: int = 2, policy: dict | None = None) -> dict:
             """Dev only: split a mock feed into category test accounts, add other test accounts,
@@ -249,14 +404,28 @@ def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(prog="python -m trend_liker.mcp_server", description=__doc__.splitlines()[0])
     ap.add_argument("--http", action="store_true", help="serve streamable HTTP instead of stdio")
     ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument("--host", default="127.0.0.1", help="bind address (keep 127.0.0.1 behind a reverse proxy)")
+    ap.add_argument("--public-url", help="hosted mode: this connector's public base URL (it serves <url>/mcp); "
+                                         "callers sign in with OAuth")
     a = ap.parse_args(argv)
+    if a.public_url and not a.http:
+        ap.error("--public-url needs --http")
     server = build_server(os.environ.get("TRENDLIKER_URL", DEFAULT_URL), os.environ.get("TRENDLIKER_TOKEN") or None,
-                          os.environ.get("TRENDLIKER_DEV_USER") or None)
-    if a.http:
-        # Localhost only: whoever can reach it acts as the connector's user.
-        asyncio.run(server.run_streamable_http_async(host="127.0.0.1", port=a.port))
-    else:
+                          os.environ.get("TRENDLIKER_DEV_USER") or None, public_url=a.public_url,
+                          issuer_url=os.environ.get("TRENDLIKER_ISSUER") or None)
+    if not a.http:
         server.run("stdio")
+        return
+    hosts = [f"127.0.0.1:{a.port}", f"localhost:{a.port}"]
+    origins = []
+    if a.public_url:
+        u = urlparse(a.public_url)
+        hosts.append(u.netloc)
+        origins.append(f"{u.scheme}://{u.netloc}")
+    elif a.host != "127.0.0.1":
+        ap.error("without --public-url (OAuth), serve on 127.0.0.1 only: anyone who can reach it acts as the connector's user")
+    security = TransportSecuritySettings(enable_dns_rebinding_protection=True, allowed_hosts=hosts, allowed_origins=origins)
+    asyncio.run(server.run_streamable_http_async(host=a.host, port=a.port, transport_security=security))
 
 
 if __name__ == "__main__":

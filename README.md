@@ -117,4 +117,20 @@ claude mcp add trend-liker -e TRENDLIKER_URL=https://your-host -e TRENDLIKER_TOK
 
 Claude Desktop takes the same command and environment in its MCP config. `trend-liker-mcp --http --port 8765` serves streamable HTTP at `http://127.0.0.1:8765/mcp` instead of stdio; it binds to localhost only, because anyone who can reach it acts as the connector's user.
 
-Not yet: a claude.ai custom connector needs the MCP server at a public HTTPS URL with its own OAuth sign-in, so each person connects as themselves. Today the connector holds one user's session token.
+### Hosted connector (claude.ai): sign in with X, analyze your feed
+
+In hosted mode each person adds the connector and signs in with X themselves; the connector then acts as them. The pieces:
+
+- **The feed server is the OAuth 2.1 authorization server** (`src/oauth.rs`): metadata at `/.well-known/oauth-authorization-server`, dynamic client registration (`/oauth/register`; redirect URIs must be https, or http to localhost), `/oauth/authorize` (sends the person through Sign in with X, then a consent page naming the app and where it returns to), and `/oauth/token` (authorization code + PKCE S256, 1-hour access tokens, single-use rotating refresh tokens). The consent page escapes everything, can't be framed, and only the person who first opened a request can answer it.
+- **X tokens are stored for timeline reading** (`src/xapi.rs`): Sign in with X asks for `offline.access`; tokens are encrypted with AES-256-GCM (`TOKEN_ENCRYPTION_KEY`, bound to the user) and refreshed automatically. `GET /api/me/x/timeline` returns your home timeline (what X shows you, up to 800 posts); `DELETE /api/me/x` forgets the tokens and revokes them at X. Without the key, no X tokens are stored and timeline tools say so.
+- **The connector checks each caller's token** with the feed server and serves the OAuth discovery metadata clients need (`--public-url`). New tools: `x_connection`, `my_x_timeline`, `analyze_my_feed` (topics, which accounts dominate and how concentrated the feed is, engagement, finance share, how a lobby would split it, and a spread-out sample for Claude to read), and `disconnect_x`. The dev-only simulation tool is never offered in hosted mode.
+
+**Deploying** (see `deploy/`):
+
+1. Get a host with a public HTTPS name, e.g. `feeds.example.com`, and Postgres.
+2. Create an X developer app (OAuth 2.0, Web App) with callback `https://feeds.example.com/auth/x/callback` and scopes `tweet.read users.read offline.access`. Reading home timelines needs an X API plan that includes that endpoint; check your plan at developer.x.com.
+3. Fill in `deploy/connector.env.example` (as `connector.env`) and load it for both processes.
+4. Run the feed server (`cargo run --release` in `universal-feed/`) and the connector (`trend-liker-mcp --http --port 8765 --public-url https://feeds.example.com`), with `deploy/Caddyfile` in front.
+5. In claude.ai: Settings → Connectors → Add custom connector → `https://feeds.example.com/mcp` → Connect. Sign in with X, approve, then ask Claude to analyze your feed.
+
+Try the whole flow locally without an X app: run `python -m trend_liker.mock_x_oauth --port 9999` and point `X_AUTHORIZE_URL`, `X_TOKEN_URL`, `X_API_BASE` and `X_REVOKE_URL` at it (see the mock's docstring).

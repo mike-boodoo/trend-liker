@@ -12,7 +12,7 @@ use crate::classify::classify;
 use crate::feed::HOME_FEED_LIMIT;
 use crate::ingest::{clamp_score, prepare_text};
 use crate::model::*;
-use crate::repo::{x_user_id, Ingested, Repo, Subscribed};
+use crate::repo::{x_user_id, Ingested, OAuthClient, Repo, Subscribed, XTokens};
 
 pub struct PgRepo {
     pool: PgPool,
@@ -164,6 +164,55 @@ impl Repo for PgRepo {
     async fn delete_session(&self, token_hash: &[u8]) -> Result<()> {
         sqlx::query("delete from sessions where token_hash = $1").bind(token_hash).execute(&self.pool).await?;
         Ok(())
+    }
+
+    async fn put_x_tokens(&self, user: &str, t: &XTokens) -> Result<()> {
+        sqlx::query(
+            "insert into x_tokens (user_id, access_token, refresh_token, expires_at, scope) values ($1,$2,$3,$4,$5)
+             on conflict (user_id) do update set access_token = excluded.access_token, refresh_token = excluded.refresh_token,
+                 expires_at = excluded.expires_at, scope = excluded.scope, updated_at = now()",
+        ).bind(user).bind(&t.access_token).bind(&t.refresh_token).bind(t.expires_at).bind(&t.scope).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    async fn get_x_tokens(&self, user: &str) -> Result<Option<XTokens>> {
+        let Some(r) = sqlx::query("select access_token, refresh_token, expires_at, scope from x_tokens where user_id = $1")
+            .bind(user).fetch_optional(&self.pool).await? else { return Ok(None) };
+        Ok(Some(XTokens {
+            access_token: r.try_get("access_token")?, refresh_token: r.try_get("refresh_token")?,
+            expires_at: r.try_get("expires_at")?, scope: r.try_get("scope")?,
+        }))
+    }
+
+    async fn delete_x_tokens(&self, user: &str) -> Result<bool> {
+        Ok(sqlx::query("delete from x_tokens where user_id = $1").bind(user).execute(&self.pool).await?.rows_affected() > 0)
+    }
+
+    async fn register_client(&self, c: &OAuthClient) -> Result<()> {
+        sqlx::query("insert into oauth_clients (client_id, client_name, redirect_uris) values ($1, $2, $3)")
+            .bind(&c.client_id).bind(&c.client_name).bind(&c.redirect_uris).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    async fn get_client(&self, client_id: &str) -> Result<Option<OAuthClient>> {
+        let Some(r) = sqlx::query("select client_id, client_name, redirect_uris from oauth_clients where client_id = $1")
+            .bind(client_id).fetch_optional(&self.pool).await? else { return Ok(None) };
+        Ok(Some(OAuthClient { client_id: r.try_get("client_id")?, client_name: r.try_get("client_name")?, redirect_uris: r.try_get("redirect_uris")? }))
+    }
+
+    async fn create_refresh_token(&self, token_hash: &[u8], client_id: &str, user: &str, expires_at: chrono::DateTime<Utc>) -> Result<()> {
+        sqlx::query("delete from oauth_refresh_tokens where user_id = $1 and expires_at <= now()").bind(user).execute(&self.pool).await?;
+        sqlx::query("insert into oauth_refresh_tokens (token_hash, client_id, user_id, expires_at) values ($1, $2, $3, $4)")
+            .bind(token_hash).bind(client_id).bind(user).bind(expires_at).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    async fn take_refresh_token(&self, token_hash: &[u8], now: chrono::DateTime<Utc>) -> Result<Option<(String, String)>> {
+        // `delete ... returning` makes the token single-use even under concurrent refreshes.
+        let Some(r) = sqlx::query("delete from oauth_refresh_tokens where token_hash = $1 returning client_id, user_id, expires_at")
+            .bind(token_hash).fetch_optional(&self.pool).await? else { return Ok(None) };
+        let expires: chrono::DateTime<Utc> = r.try_get("expires_at")?;
+        Ok((expires > now).then(|| Ok::<_, sqlx::Error>((r.try_get("client_id")?, r.try_get("user_id")?))).transpose()?)
     }
 
     async fn subscribe(&self, user: &str, feed: &str) -> Result<Subscribed> {
@@ -452,6 +501,37 @@ mod tests {
         pg.ensure_user("dev").await.unwrap();
         pg.ensure_user("dev").await.unwrap();
         assert!(pg.get_user("dev").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn connector_storage() {
+        let Some(pg) = fresh().await else { return };
+        pg.upsert_x_user("7", "zed").await.unwrap();
+        let t = XTokens { access_token: vec![1, 2], refresh_token: Some(vec![3]), expires_at: Utc::now(), scope: "tweet.read".into() };
+        pg.put_x_tokens("x-7", &t).await.unwrap();
+        let t2 = XTokens { access_token: vec![9], refresh_token: None, ..t.clone() };
+        pg.put_x_tokens("x-7", &t2).await.unwrap();
+        let got = pg.get_x_tokens("x-7").await.unwrap().unwrap();
+        assert_eq!((got.access_token, got.refresh_token), (vec![9], None), "replaced, not duplicated");
+        assert!(pg.delete_x_tokens("x-7").await.unwrap());
+        assert!(!pg.delete_x_tokens("x-7").await.unwrap());
+
+        let c = OAuthClient { client_id: "c1".into(), client_name: "Claude".into(), redirect_uris: vec!["https://a/cb".into()] };
+        pg.register_client(&c).await.unwrap();
+        assert_eq!(pg.get_client("c1").await.unwrap(), Some(c));
+        assert_eq!(pg.get_client("nope").await.unwrap(), None);
+
+        let now = Utc::now();
+        pg.create_refresh_token(b"rt", "c1", "x-7", now + chrono::Duration::days(1)).await.unwrap();
+        pg.create_refresh_token(b"old", "c1", "x-7", now - chrono::Duration::seconds(1)).await.unwrap();
+        assert_eq!(pg.take_refresh_token(b"old", now).await.unwrap(), None, "expired");
+        let pg = std::sync::Arc::new(pg);
+        let takes: Vec<_> = (0..8).map(|_| { let pg = pg.clone(); tokio::spawn(async move { pg.take_refresh_token(b"rt", Utc::now()).await.unwrap() }) }).collect();
+        let mut won = 0;
+        for t in takes { won += t.await.unwrap().is_some() as usize; }
+        assert_eq!(won, 1, "a refresh token works once, even under concurrent use");
+        sqlx::query("delete from users where user_id = 'x-7'").execute(&pg.pool).await.unwrap();
+        assert_eq!(count(&pg, "select count(*) from oauth_refresh_tokens").await, 0, "removed with the user");
     }
 
     #[tokio::test]

@@ -1,0 +1,19 @@
+# One public HTTPS host for the whole connector. Caddy gets the TLS certificate automatically.
+# The feed server (Rust) listens on 127.0.0.1:3000, the MCP connector (Python) on 127.0.0.1:8765.
+feeds.example.com {
+	# The connector itself, and the metadata that tells clients where to sign in.
+	handle /mcp* {
+		reverse_proxy 127.0.0.1:8765 {
+			flush_interval -1 # stream responses (SSE) immediately
+		}
+	}
+	handle /.well-known/oauth-protected-resource* {
+		reverse_proxy 127.0.0.1:8765
+	}
+	# Everything else: sign-in with X, the OAuth server, the API and pages.
+	handle {
+		reverse_proxy 127.0.0.1:3000 {
+			flush_interval -1
+		}
+	}
+}

@@ -4,7 +4,7 @@ use uuid::Uuid;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use crate::model::{Candidate, ContentItem, HomeFeed, PublicFeed, PublishingSetting, UserSettings};
-use crate::repo::{x_user_id, Ingested, Repo, Subscribed};
+use crate::repo::{x_user_id, Ingested, OAuthClient, Repo, Subscribed, XTokens};
 
 #[derive(Clone)]
 pub struct Store {
@@ -15,6 +15,10 @@ pub struct Store {
     pub contributors: Arc<RwLock<HashMap<Uuid, HashSet<String>>>>,
     /// token hash -> (user, expiry)
     pub sessions: Arc<RwLock<HashMap<Vec<u8>, (String, DateTime<Utc>)>>>,
+    pub x_tokens: Arc<RwLock<HashMap<String, XTokens>>>,
+    pub clients: Arc<RwLock<HashMap<String, OAuthClient>>>,
+    /// refresh token hash -> (client, user, expiry)
+    pub refresh_tokens: Arc<RwLock<HashMap<Vec<u8>, (String, String, DateTime<Utc>)>>>,
 }
 
 impl Store {
@@ -25,6 +29,9 @@ impl Store {
             users: Arc::new(RwLock::new(HashMap::new())),
             contributors: Arc::new(RwLock::new(HashMap::new())),
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            x_tokens: Arc::new(RwLock::new(HashMap::new())),
+            clients: Arc::new(RwLock::new(HashMap::new())),
+            refresh_tokens: Arc::new(RwLock::new(HashMap::new())),
         }
     }
     pub fn insert_item(&self, item: ContentItem) { self.items.write().unwrap().insert(item.id, item); }
@@ -108,5 +115,33 @@ impl Repo for Store {
     async fn delete_session(&self, token_hash: &[u8]) -> anyhow::Result<()> {
         self.sessions.write().unwrap().remove(token_hash);
         Ok(())
+    }
+    async fn put_x_tokens(&self, user: &str, tokens: &XTokens) -> anyhow::Result<()> {
+        self.x_tokens.write().unwrap().insert(user.to_string(), tokens.clone());
+        Ok(())
+    }
+    async fn get_x_tokens(&self, user: &str) -> anyhow::Result<Option<XTokens>> {
+        Ok(self.x_tokens.read().unwrap().get(user).cloned())
+    }
+    async fn delete_x_tokens(&self, user: &str) -> anyhow::Result<bool> {
+        Ok(self.x_tokens.write().unwrap().remove(user).is_some())
+    }
+    async fn register_client(&self, client: &OAuthClient) -> anyhow::Result<()> {
+        self.clients.write().unwrap().insert(client.client_id.clone(), client.clone());
+        Ok(())
+    }
+    async fn get_client(&self, client_id: &str) -> anyhow::Result<Option<OAuthClient>> {
+        Ok(self.clients.read().unwrap().get(client_id).cloned())
+    }
+    async fn create_refresh_token(&self, token_hash: &[u8], client_id: &str, user: &str, expires_at: DateTime<Utc>) -> anyhow::Result<()> {
+        let mut tokens = self.refresh_tokens.write().unwrap();
+        let now = Utc::now();
+        tokens.retain(|_, (_, _, exp)| *exp > now);
+        tokens.insert(token_hash.to_vec(), (client_id.to_string(), user.to_string(), expires_at));
+        Ok(())
+    }
+    async fn take_refresh_token(&self, token_hash: &[u8], now: DateTime<Utc>) -> anyhow::Result<Option<(String, String)>> {
+        Ok(self.refresh_tokens.write().unwrap().remove(token_hash)
+            .filter(|(_, _, exp)| *exp > now).map(|(c, u, _)| (c, u)))
     }
 }

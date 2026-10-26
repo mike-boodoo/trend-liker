@@ -37,6 +37,7 @@ pub struct XAuthConfig {
     pub authorize_url: String,
     pub token_url: String,
     pub api_base: String,
+    pub revoke_url: Option<String>,
     pub scopes: String,
 }
 
@@ -51,29 +52,39 @@ impl XAuthConfig {
             authorize_url: var("X_AUTHORIZE_URL").unwrap_or_else(|| "https://x.com/i/oauth2/authorize".into()),
             token_url: var("X_TOKEN_URL").unwrap_or_else(|| "https://api.x.com/2/oauth2/token".into()),
             api_base: var("X_API_BASE").unwrap_or_else(|| "https://api.x.com".into()),
-            scopes: var("X_SCOPES").unwrap_or_else(|| "tweet.read users.read".into()),
+            revoke_url: Some(var("X_REVOKE_URL").unwrap_or_else(|| "https://api.x.com/2/oauth2/revoke".into())),
+            // offline.access gets a refresh token, so the timeline keeps working past X's 2-hour tokens.
+            scopes: var("X_SCOPES").unwrap_or_else(|| "tweet.read users.read offline.access".into()),
         })
     }
 }
 
-struct Pending { verifier: String, created: DateTime<Utc> }
+struct Pending { verifier: String, created: DateTime<Utc>, next: Option<String> }
 
 pub struct Auth {
     pub x: Option<XAuthConfig>,
     /// `POST /auth/dev/login` lets anyone sign in as anyone. Local development only.
     pub dev_login: bool,
-    http: reqwest::Client,
+    /// Encrypts stored X tokens. None: X tokens aren't kept, so timeline features are off.
+    pub cipher: Option<crate::xapi::TokenCipher>,
+    pub(crate) http: reqwest::Client,
     pending: Mutex<HashMap<String, Pending>>,
 }
 
 impl Auth {
     pub fn new(x: Option<XAuthConfig>, dev_login: bool, http: reqwest::Client) -> Self {
-        Self { x, dev_login, http, pending: Mutex::new(HashMap::new()) }
+        Self { x, dev_login, cipher: None, http, pending: Mutex::new(HashMap::new()) }
+    }
+
+    pub fn with_cipher(mut self, cipher: Option<crate::xapi::TokenCipher>) -> Self {
+        self.cipher = cipher;
+        self
     }
 
     pub fn from_env() -> Self {
         let dev = std::env::var("AUTH_DEV_LOGIN").is_ok_and(|v| v == "1");
-        Self::new(XAuthConfig::from_env(), dev, reqwest::Client::new())
+        let cipher = crate::xapi::TokenCipher::from_env().unwrap_or_else(|e| panic!("{e}"));
+        Self::new(XAuthConfig::from_env(), dev, reqwest::Client::new()).with_cipher(cipher)
     }
 
     /// Cookies are `Secure` unless the callback itself is plain http (local development).
@@ -81,13 +92,13 @@ impl Auth {
         self.x.as_ref().is_none_or(|x| !x.redirect_uri.starts_with("http://"))
     }
 
-    fn cookie(&self, name: &str, value: &str, max_age_secs: i64) -> String {
+    pub(crate) fn cookie(&self, name: &str, value: &str, max_age_secs: i64) -> String {
         let secure = if self.secure_cookies() { "; Secure" } else { "" };
         format!("{name}={value}; HttpOnly; SameSite=Lax; Path=/; Max-Age={max_age_secs}{secure}")
     }
 }
 
-fn random_token() -> String {
+pub(crate) fn random_token() -> String {
     let mut buf = [0u8; 32];
     getrandom::fill(&mut buf).expect("OS randomness unavailable");
     URL_SAFE_NO_PAD.encode(buf)
@@ -98,7 +109,7 @@ pub fn hash_token(token: &str) -> Vec<u8> { Sha256::digest(token.as_bytes()).to_
 /// RFC 7636 S256 code challenge.
 pub fn pkce_challenge(verifier: &str) -> String { URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes())) }
 
-fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+pub(crate) fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get_all(header::COOKIE).iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(';'))
@@ -107,7 +118,7 @@ fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
         .map(|(_, v)| v)
 }
 
-fn session_token(headers: &HeaderMap) -> Option<&str> {
+pub(crate) fn session_token(headers: &HeaderMap) -> Option<&str> {
     headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "))
         .or_else(|| cookie_value(headers, SESSION_COOKIE))
 }
@@ -144,9 +155,18 @@ pub fn routes() -> Router<AppState> {
         .route("/api/me", get(me))
 }
 
+/// A same-site path to return to after sign-in (never another origin).
+pub(crate) fn safe_next(next: Option<&str>) -> Option<String> {
+    next.filter(|n| n.starts_with('/') && !n.starts_with("//") && !n.contains('\\') && !n.chars().any(char::is_control))
+        .map(str::to_string)
+}
+
+#[derive(Deserialize)]
+struct LoginQuery { next: Option<String> }
+
 /// Start sign-in: remember a PKCE verifier under a fresh `state`, bind that state to this
 /// browser with a short-lived cookie, and send the browser to X.
-async fn login(State(state): State<AppState>) -> Result<Response, StatusCode> {
+async fn login(State(state): State<AppState>, Query(q): Query<LoginQuery>) -> Result<Response, StatusCode> {
     let x = state.auth.x.as_ref().ok_or(StatusCode::NOT_FOUND)?;
     let (oauth_state, verifier) = (random_token(), random_token());
     {
@@ -154,7 +174,7 @@ async fn login(State(state): State<AppState>) -> Result<Response, StatusCode> {
         let cutoff = Utc::now() - Duration::seconds(PENDING_TTL_SECS);
         pending.retain(|_, p| p.created > cutoff);
         if pending.len() >= MAX_PENDING { return Err(StatusCode::SERVICE_UNAVAILABLE); }
-        pending.insert(oauth_state.clone(), Pending { verifier: verifier.clone(), created: Utc::now() });
+        pending.insert(oauth_state.clone(), Pending { verifier: verifier.clone(), created: Utc::now(), next: safe_next(q.next.as_deref()) });
     }
     let url = reqwest::Url::parse_with_params(&x.authorize_url, &[
         ("response_type", "code"),
@@ -171,9 +191,6 @@ async fn login(State(state): State<AppState>) -> Result<Response, StatusCode> {
 
 #[derive(Deserialize)]
 struct Callback { code: Option<String>, state: Option<String>, error: Option<String> }
-
-#[derive(Deserialize)]
-struct TokenResponse { access_token: String }
 
 #[derive(Deserialize)]
 struct Me { data: MeData }
@@ -204,7 +221,7 @@ async fn callback(State(state): State<AppState>, headers: HeaderMap, Query(q): Q
     ]);
     if let Some(secret) = &x.client_secret { req = req.basic_auth(&x.client_id, Some(secret)); }
     let upstream = |e: reqwest::Error| { eprintln!("X sign-in failed: {e}"); StatusCode::BAD_GATEWAY.into_response() };
-    let token: TokenResponse = req.send().await.and_then(|r| r.error_for_status()).map_err(upstream)?
+    let token: crate::xapi::XTokenResponse = req.send().await.and_then(|r| r.error_for_status()).map_err(upstream)?
         .json().await.map_err(upstream)?;
     let me: Me = state.auth.http.get(format!("{}/2/users/me", x.api_base)).bearer_auth(&token.access_token)
         .send().await.and_then(|r| r.error_for_status()).map_err(upstream)?
@@ -212,10 +229,12 @@ async fn callback(State(state): State<AppState>, headers: HeaderMap, Query(q): Q
 
     let user = state.repo.upsert_x_user(&me.data.id, &me.data.username).await
         .map_err(|e| internal(e).into_response())?;
+    crate::xapi::store_tokens(&state, &user, &token).await.map_err(|e| internal(e).into_response())?;
     let session = start_session(&state, &user).await.map_err(IntoResponse::into_response)?;
     let clear_state = state.auth.cookie(STATE_COOKIE, "", 0);
+    let next = pending.next.unwrap_or_else(|| "/".into());
     // AppendHeaders: a plain header array would let the second Set-Cookie replace the first.
-    Ok((AppendHeaders([(header::SET_COOKIE, session), (header::SET_COOKIE, clear_state)]), Redirect::to("/")).into_response())
+    Ok((AppendHeaders([(header::SET_COOKIE, session), (header::SET_COOKIE, clear_state)]), Redirect::to(&next)).into_response())
 }
 
 /// Returns the Set-Cookie value; the token is also usable as a Bearer token.
@@ -320,7 +339,7 @@ mod tests {
         let x = XAuthConfig {
             client_id: "cid".into(), client_secret: None, redirect_uri: format!("{app_url}/auth/x/callback"),
             authorize_url: format!("{x_url}/authorize"), token_url: format!("{x_url}/2/oauth2/token"),
-            api_base: x_url.clone(), scopes: "tweet.read users.read".into(),
+            api_base: x_url.clone(), revoke_url: None, scopes: "tweet.read users.read".into(),
         };
         let store = crate::store::Store::new();
         crate::seed::seed(&store);
@@ -328,6 +347,7 @@ mod tests {
         let state = AppState {
             repo: std::sync::Arc::new(store), lobbies: Default::default(),
             auth: std::sync::Arc::new(Auth::new(Some(x), false, http.clone())),
+            oauth: std::sync::Arc::new(crate::oauth::OAuth::new(crate::oauth::OAuthConfig { issuer: app_url.clone(), resources: vec![] })),
         };
         tokio::spawn(mock_x(x_l));
         tokio::spawn(async move { axum::serve(app_l, crate::app(state)).await.unwrap() });
@@ -390,6 +410,15 @@ mod tests {
         // Declining on X's side.
         let declined = c.get(format!("{app_url}/auth/x/callback?error=access_denied&state=x")).send().await.unwrap();
         assert_eq!(declined.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn next_must_stay_on_this_site() {
+        assert_eq!(safe_next(Some("/oauth/consent?req=abc")).as_deref(), Some("/oauth/consent?req=abc"));
+        for bad in ["https://evil.example", "//evil.example", "/\\evil.example", "evil", "/a\nb"] {
+            assert_eq!(safe_next(Some(bad)), None, "{bad}");
+        }
+        assert_eq!(safe_next(None), None);
     }
 
     #[test]
