@@ -12,7 +12,7 @@ use crate::classify::classify;
 use crate::feed::HOME_FEED_LIMIT;
 use crate::ingest::{clamp_score, prepare_text};
 use crate::model::*;
-use crate::repo::{Ingested, Repo, Subscribed};
+use crate::repo::{x_user_id, Ingested, Repo, Subscribed};
 
 pub struct PgRepo {
     pool: PgPool,
@@ -126,13 +126,44 @@ impl Repo for PgRepo {
     }
 
     async fn get_user(&self, id: &str) -> Result<Option<UserSettings>> {
-        let Some(opt_in) = sqlx::query_scalar::<_, bool>("select publish_opt_in from users where user_id = $1")
+        let Some(row) = sqlx::query("select publish_opt_in, username from users where user_id = $1")
             .bind(id).fetch_optional(&self.pool).await? else { return Ok(None) };
         Ok(Some(UserSettings {
             user_id: id.to_string(),
             public_feeds: subscriptions(&self.pool, id).await?,
-            publish_opt_in: opt_in,
+            publish_opt_in: row.try_get("publish_opt_in")?,
+            username: row.try_get("username")?,
         }))
+    }
+
+    async fn upsert_x_user(&self, x_id: &str, username: &str) -> Result<String> {
+        Ok(sqlx::query_scalar(
+            "insert into users (user_id, x_id, username) values ($1, $2, $3)
+             on conflict (user_id) do update set username = excluded.username
+             returning user_id",
+        ).bind(x_user_id(x_id)).bind(x_id).bind(username).fetch_one(&self.pool).await?)
+    }
+
+    async fn ensure_user(&self, user: &str) -> Result<()> {
+        sqlx::query("insert into users (user_id) values ($1) on conflict do nothing").bind(user).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    async fn create_session(&self, token_hash: &[u8], user: &str, expires_at: chrono::DateTime<Utc>) -> Result<()> {
+        sqlx::query("delete from sessions where user_id = $1 and expires_at <= now()").bind(user).execute(&self.pool).await?;
+        sqlx::query("insert into sessions (token_hash, user_id, expires_at) values ($1, $2, $3)")
+            .bind(token_hash).bind(user).bind(expires_at).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    async fn session_user(&self, token_hash: &[u8], now: chrono::DateTime<Utc>) -> Result<Option<String>> {
+        Ok(sqlx::query_scalar("select user_id from sessions where token_hash = $1 and expires_at > $2")
+            .bind(token_hash).bind(now).fetch_optional(&self.pool).await?)
+    }
+
+    async fn delete_session(&self, token_hash: &[u8]) -> Result<()> {
+        sqlx::query("delete from sessions where token_hash = $1").bind(token_hash).execute(&self.pool).await?;
+        Ok(())
     }
 
     async fn subscribe(&self, user: &str, feed: &str) -> Result<Subscribed> {
@@ -397,11 +428,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn x_users_and_sessions() {
+        let Some(pg) = fresh().await else { return };
+        assert_eq!(pg.upsert_x_user("42", "mike").await.unwrap(), "x-42");
+        assert_eq!(pg.upsert_x_user("42", "mike_renamed").await.unwrap(), "x-42");
+        let u = pg.get_user("x-42").await.unwrap().unwrap();
+        assert_eq!((u.username.as_deref(), u.publish_opt_in, u.public_feeds.len()), (Some("mike_renamed"), false, 0));
+
+        let now = Utc::now();
+        pg.create_session(b"live", "x-42", now + chrono::Duration::hours(1)).await.unwrap();
+        pg.create_session(b"stale", "x-42", now - chrono::Duration::seconds(1)).await.unwrap();
+        assert_eq!(pg.session_user(b"live", now).await.unwrap().as_deref(), Some("x-42"));
+        assert_eq!(pg.session_user(b"stale", now).await.unwrap(), None, "expired");
+        assert_eq!(pg.session_user(b"nope", now).await.unwrap(), None);
+        pg.delete_session(b"live").await.unwrap();
+        assert_eq!(pg.session_user(b"live", now).await.unwrap(), None);
+
+        pg.create_session(b"again", "x-42", now + chrono::Duration::hours(1)).await.unwrap();
+        assert_eq!(count(&pg, "select count(*) from sessions where user_id = 'x-42'").await, 1, "expired ones pruned");
+        sqlx::query("delete from users where user_id = 'x-42'").execute(&pg.pool).await.unwrap();
+        assert_eq!(pg.session_user(b"again", now).await.unwrap(), None, "sessions go with the user");
+
+        pg.ensure_user("dev").await.unwrap();
+        pg.ensure_user("dev").await.unwrap();
+        assert!(pg.get_user("dev").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
     async fn parity_with_in_memory_store() {
         let Some(pg) = fresh_opted_in().await else { return };
         let mem = Store::new();
         crate::seed::seed(&mem);
-        mem.insert_user(UserSettings { user_id: "bob".into(), public_feeds: vec![], publish_opt_in: true });
+        mem.insert_user(UserSettings { user_id: "bob".into(), public_feeds: vec![], publish_opt_in: true, username: None });
         Repo::set_publishing(&mem, "demo", true).await.unwrap();
         let batch = || vec![
             cand(Source::X, "a", "Agents with MCP #AI", Some(0.7)),

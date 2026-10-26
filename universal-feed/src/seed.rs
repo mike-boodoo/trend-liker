@@ -31,7 +31,7 @@ pub fn demo_data() -> DemoData {
         id: category.clone(), name: category.clone(), description: format!("Public {} feed", category),
         categories: vec![category], items: item_ids,
     }).collect();
-    let users = vec![UserSettings { user_id: "demo".into(), public_feeds: vec!["ai".into(), "rust".into(), "cloud".into()], publish_opt_in: false }];
+    let users = vec![UserSettings { user_id: "demo".into(), public_feeds: vec!["ai".into(), "rust".into(), "cloud".into()], publish_opt_in: false, username: None }];
     DemoData { items, feeds, users }
 }
 

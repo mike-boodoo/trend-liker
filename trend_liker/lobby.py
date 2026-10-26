@@ -13,8 +13,11 @@ KINDS = ("impression", "like", "bookmark", "reply", "skip")
 
 
 class LobbyClient:
-    def __init__(self, base_url: str = DEFAULT_URL, transport: httpx.AsyncBaseTransport | None = None):
-        self._http = httpx.AsyncClient(base_url=base_url, transport=transport, timeout=10.0)
+    def __init__(self, base_url: str = DEFAULT_URL, transport: httpx.AsyncBaseTransport | None = None,
+                 token: str | None = None):
+        """`token` is a session token (see trend_liker.auth); requests act as that user."""
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        self._http = httpx.AsyncClient(base_url=base_url, transport=transport, timeout=10.0, headers=headers)
 
     async def aclose(self) -> None:
         await self._http.aclose()

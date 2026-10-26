@@ -64,3 +64,20 @@ A lobby is a "game server" for a feed. Members pool what their **own** platform 
 Routes: `POST/GET /api/lobbies`, `GET /api/lobbies/{id}`, `PUT .../policy` (owner), `POST .../members`, `DELETE .../members/{user}`, `POST .../contribute`, `POST .../interactions` (`impression|like|bookmark|reply|skip`, `active: false` retracts), `GET .../feed`, `GET .../events`.
 
 Lobby state is in memory (like a game server's live state), so it resets on restart. Users and consent live in the Repo.
+
+## Authentication: Sign in with X (`src/auth.rs`)
+
+Every API that acts for a user takes the user from the session; a request that names a different user (in a path, `user_id` field or `?user=`) gets 403, and one with no valid session gets 401. Public: `GET /api/feeds`, `GET /api/lobbies`, `GET /api/lobbies/{id}`.
+
+- **Sign-in**: `GET /auth/x/login` starts OAuth 2.0 with PKCE (S256) against X; `GET /auth/x/callback` checks the one-time `state` (10-minute expiry, and bound to the browser that started sign-in by a short-lived cookie, which blocks login CSRF), exchanges the code, asks X `/2/users/me` who signed in, and creates or updates the user `x-<X id>`. X's access token is used for that one lookup and not stored.
+- **Sessions**: 30 days, random 256-bit tokens; only their SHA-256 is stored. Sent as an `HttpOnly; SameSite=Lax` cookie (`Secure` unless the callback is plain http), or as `Authorization: Bearer <token>` for API clients. `POST /auth/logout` ends it; `GET /api/me` returns the signed-in user.
+- **Config**: `X_CLIENT_ID` (required to enable), `X_CLIENT_SECRET` (confidential clients), `X_REDIRECT_URI`; `X_AUTHORIZE_URL`, `X_TOKEN_URL`, `X_API_BASE` override X's endpoints. `AUTH_DEV_LOGIN=1` enables `POST /auth/dev/login {"user_id"}`, which signs in as anyone: local development only (the server warns at startup).
+- **Python**: `trend_liker.auth.sign_in_with_x(approve)` runs the flow and returns a session token; pass `token=` to `ForUsClient` / `LobbyClient`.
+- **Without an X app**: `python -m trend_liker.mock_x_oauth --port 9999` is a local stand-in for X's OAuth endpoints (auto-approves; `login_as=<handle>` picks who; PKCE enforced), then:
+
+  ```
+  X_CLIENT_ID=mock X_AUTHORIZE_URL=http://127.0.0.1:9999/i/oauth2/authorize \
+  X_TOKEN_URL=http://127.0.0.1:9999/2/oauth2/token X_API_BASE=http://127.0.0.1:9999 cargo run
+  ```
+
+Cross-site request forgery: the session cookie is `SameSite=Lax`, state-changing routes need JSON bodies or non-simple methods, and the server sends no CORS headers, so other sites can't make those requests with your cookie. Pending sign-ins are held in memory, so a sign-in can't span a server restart or multiple instances.
